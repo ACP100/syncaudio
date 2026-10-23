@@ -177,6 +177,52 @@ object TimeSync {
         return getOffset(peerIp)
     }
 
+    /**
+     * Takes several clock samples from [serverIp] and keeps the one with the shortest round trip,
+     * since that sample is the least affected by Wi-Fi jitter.
+     *
+     * Returns (offset, roundTripMs), where offset is server time minus local time, or null if no
+     * sample got a reply. Blocks, so call it off the main thread.
+     */
+    fun measureBestOffset(serverIp: String, samples: Int = 5): Pair<Long, Long>? {
+        val socket = DatagramSocket()
+        socket.soTimeout = 1000
+        val addr = InetAddress.getByName(serverIp)
+        val request = "SYNC".toByteArray()
+        val response = ByteArray(64)
+
+        var best: Pair<Long, Long>? = null
+        try {
+            repeat(samples) {
+                try {
+                    val t0 = System.currentTimeMillis()
+                    socket.send(DatagramPacket(request, request.size, addr, PORT))
+                    val packet = DatagramPacket(response, response.size)
+                    socket.receive(packet)
+                    val t3 = System.currentTimeMillis()
+
+                    val parts = String(packet.data, 0, packet.length).trim().split(",")
+                    if (parts.size < 2) return@repeat
+                    val t1 = parts[0].toLong()
+                    val t2 = parts[1].toLong()
+
+                    val roundTrip = (t3 - t0) - (t2 - t1)
+                    val offset = ((t1 - t0) + (t2 - t3)) / 2
+                    if (best == null || roundTrip < best!!.second) {
+                        best = offset to roundTrip
+                    }
+                } catch (e: Exception) {
+                    DebugUtils.logWarning("⚠️ Clock sample failed: ${e.message}")
+                }
+            }
+        } finally {
+            socket.close()
+        }
+
+        best?.let { DebugUtils.log("⏰ Clock offset to $serverIp: ${it.first} ms (rtt ${it.second} ms)") }
+        return best
+    }
+
     // Async version that runs in background
     fun getOffsetAsync(serverIp: String, onComplete: (Long?) -> Unit) {
         Thread {

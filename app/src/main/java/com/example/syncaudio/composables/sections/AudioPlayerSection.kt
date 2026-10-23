@@ -22,7 +22,6 @@ import kotlinx.coroutines.withContext
 fun AudioPlayerSection(
     context: Context,
     scope: CoroutineScope,
-    clients: List<String> = emptyList(),
     onStatusUpdate: (String) -> Unit
 ) {
     // Store a shared player instance
@@ -89,14 +88,11 @@ fun AudioPlayerSection(
                 onClick = {
                     scope.launch {
                         val fileUri: Uri? = FileSelectionManager.getSelectedFile()
-                        if (fileUri != null && clients.isNotEmpty()) {
-                            val delayMs = 2000L
-                            val serverIp = "192.168.1.69" // Replace with actual server IP
-                            AudioSyncManager.setContext(context)
-                            AudioSyncManager.broadcastPlayCommand(serverIp, fileUri, delayMs, clients)
-                            onStatusUpdate("🌐 Broadcast play command sent to ${clients.size} devices")
+                        if (fileUri != null) {
+                            AudioSyncManager.broadcastPlayCommand(fileUri, delayMs = 2000L)
+                            onStatusUpdate("🌐 Play command broadcast to all phones on the network")
                         } else {
-                            onStatusUpdate("⚠️ Cannot play: No audio file or no clients")
+                            onStatusUpdate("⚠️ Cannot play: No audio file selected")
                         }
                     }
                 },

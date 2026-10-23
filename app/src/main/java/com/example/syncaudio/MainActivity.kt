@@ -49,6 +49,10 @@ class MainActivity : ComponentActivity() {
         // Initialize SyncClient with context
         SyncClient.setContext(this)
 
+        // Every phone listens for play commands and answers clock requests
+        AudioSyncManager.setContext(this)
+        AudioSyncManager.startListening()
+
         // Check network permissions
         checkNetworkPermissions()
 
