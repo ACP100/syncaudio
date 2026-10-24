@@ -8,7 +8,10 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -51,6 +54,7 @@ fun SimpleSyncScreen(onOpenAdvanced: () -> Unit) {
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         Text("SyncAudio", fontSize = 32.sp, fontWeight = FontWeight.Bold)
+        Text("v${remember { SyncLog.appVersion(context) }}", fontSize = 12.sp)
 
         when (role) {
             Role.NONE -> {
@@ -150,6 +154,7 @@ fun SimpleSyncScreen(onOpenAdvanced: () -> Unit) {
         }
 
         Spacer(Modifier.height(8.dp))
+        DebugLogCard()
         TextButton(onClick = onOpenAdvanced) { Text("Advanced testing tools", fontSize = 13.sp) }
     }
 }
@@ -161,11 +166,49 @@ private fun FineTune() {
     fun set(value: Long) {
         adjust = value
         AudioSyncManager.adjustMs = value
+        SyncLog.add("Fine-tune: $value ms")
     }
     Text("Still hear an echo? Fine-tune this phone:", fontSize = 13.sp, textAlign = TextAlign.Center)
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         OutlinedButton(onClick = { set(adjust - 5) }) { Text("◀ Earlier") }
         Text("${if (adjust > 0) "+" else ""}$adjust ms", modifier = Modifier.widthIn(min = 64.dp), textAlign = TextAlign.Center)
         OutlinedButton(onClick = { set(adjust + 5) }) { Text("Later ▶") }
+    }
+}
+
+/** The sync engine's log, newest first, with a button that copies it (plus app and phone info). */
+@Composable
+private fun DebugLogCard() {
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    val lines by SyncLog.lines.collectAsState()
+    var copied by remember { mutableStateOf(false) }
+    LaunchedEffect(lines.size) { copied = false }
+
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Debug log", fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                TextButton(onClick = { SyncLog.clear() }) { Text("Clear") }
+                Button(onClick = {
+                    clipboard.setText(AnnotatedString(SyncLog.report(context)))
+                    copied = true
+                }) { Text(if (copied) "Copied" else "Copy log") }
+            }
+            Text("After playing a song, tap Copy log on each phone and paste both into the chat.", fontSize = 12.sp)
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .height(260.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Text(
+                    if (lines.isEmpty()) "Nothing yet" else lines.asReversed().joinToString("\n"),
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 10.sp,
+                    lineHeight = 13.sp
+                )
+            }
+        }
     }
 }

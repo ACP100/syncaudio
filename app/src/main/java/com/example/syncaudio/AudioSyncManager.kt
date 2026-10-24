@@ -85,13 +85,14 @@ object AudioSyncManager {
 
     private fun setStatus(text: String) {
         _status.value = text
-        DebugUtils.log("🎵 $text")
+        SyncLog.add("Status: $text")
     }
 
     /** What SyncServer replies to a POLL: "STATE|<host now>|<song name>|<target or 0>|<stop seq>". */
     fun pollReply(fromIp: String): String {
         val now = System.currentTimeMillis()
-        joinedPhones[fromIp] = now
+        val lastSeen = joinedPhones.put(fromIp, now)
+        if (lastSeen == null || now - lastSeen > 3000) SyncLog.add("Host: phone $fromIp is polling")
         val target = currentPlayTarget.takeIf { it > now } ?: 0L
         return "STATE|$now|${hostSongName()}|$target|$stopSeq"
     }
@@ -119,6 +120,7 @@ object AudioSyncManager {
         SyncServer.start()
         SongServer.start(ctx)
         holdLowLatencyWifi(true)
+        SyncLog.add("Host: started, address ${NetworkUtils.getLocalIpAddress(ctx)}")
         setStatus("Hosting. Pick a song, then press Play for everyone.")
     }
 
@@ -209,6 +211,7 @@ object AudioSyncManager {
                         }
                     },
                     onCompleted = { file ->
+                        SyncLog.add("Join: got '$song', ${file.length() / 1024} KB in ${System.currentTimeMillis() - lastDownloadAttempt} ms")
                         downloadedSong = Uri.fromFile(file)
                         downloadedName = song
                     }
@@ -296,6 +299,8 @@ object AudioSyncManager {
     private fun pollLoop() {
         var socket: DatagramSocket? = null
         var polledIp = ""
+        var polls = 0
+        var timeouts = 0
         while (isListening) {
             try {
                 val serverIp = ConnectionManager.connectionStatus.value
@@ -312,6 +317,8 @@ object AudioSyncManager {
                 if (serverIp != polledIp) {
                     polledIp = serverIp
                     synchronized(pollSamples) { pollSamples.clear() }
+                    polls = 0
+                    timeouts = 0
                     setStatus("Connected to host $serverIp")
                 }
                 if (socket == null) socket = DatagramSocket().apply { soTimeout = 500 }
@@ -328,6 +335,7 @@ object AudioSyncManager {
                 val parts = String(reply.data, 0, reply.length).split("|")
                 if (parts.size == 5 && parts[0] == "STATE") {
                     parts[1].toLongOrNull()?.let { hostNow -> addPollSample(hostNow - (t0 + t3) / 2, t3 - t0) }
+                    if (++polls % 50 == 0) logClock(t3 - t0, timeouts)
                     val song = parts[2]
                     val targetTime = parts[3].toLongOrNull() ?: 0L
                     val remoteStopSeq = parts[4].toIntOrNull() ?: 0
@@ -353,6 +361,7 @@ object AudioSyncManager {
                 Thread.sleep(POLL_INTERVAL_MS)
             } catch (e: java.net.SocketTimeoutException) {
                 // Server didn't answer this round; try again
+                timeouts++
             } catch (e: Exception) {
                 DebugUtils.logWarning("⚠️ Poll failed: ${e.message}")
                 socket?.close()
@@ -361,6 +370,19 @@ object AudioSyncManager {
             }
         }
         socket?.close()
+    }
+
+    /** Every ~5 s while connected: how good the clock estimate is. */
+    private fun logClock(lastRoundTrip: Long, timeouts: Int) {
+        val samples = synchronized(pollSamples) { pollSamples.toList() }
+        val estimate = bestPollSample() ?: return
+        val rtts = samples.map { it.second }
+        val offsets = samples.sortedBy { it.second }.take(5).map { it.first }
+        SyncLog.add(
+            "Clock: offset ${estimate.first} ms (fastest offsets ${offsets.joinToString()}), " +
+                "rtt min ${rtts.minOrNull()} / median ${rtts.sorted()[rtts.size / 2]} / last $lastRoundTrip ms, " +
+                "${rtts.size} samples, $timeouts timeouts"
+        )
     }
 
     private fun addPollSample(offset: Long, roundTrip: Long) {
@@ -432,8 +454,8 @@ object AudioSyncManager {
             return
         }
 
+        SyncLog.add("Join: play '$localName' starts in ${-lateBy} ms (clock offset $offset ms, rtt $rtt ms, fine-tune $adjustMs ms)")
         setStatus("▶️ Playing '$localName' in sync with the host")
-        DebugUtils.log("⏱️ clock offset $offset ms, rtt $rtt ms")
         activePlayers.add(player)
         player.playAtTimestamp(
             targetTime,
@@ -462,7 +484,7 @@ object AudioSyncManager {
             currentPlay = "$trackName|$targetTime"
             val message = "PLAY|$trackName|$targetTime".toByteArray()
             sendBroadcast(message)
-            DebugUtils.logNetwork("📤 Play command broadcast for '$trackName' at $targetTime")
+            SyncLog.add("Host: play '$trackName' in $delayMs ms, ${joinedPhoneCount()} phones polling, fine-tune $adjustMs ms")
 
             // This phone is the clock reference, so its local play uses an offset of 0
             Thread {

@@ -12,6 +12,7 @@ import android.media.MediaFormat
 import android.net.Uri
 import android.util.Log
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import kotlin.math.abs
 import kotlin.math.min
 import kotlin.math.roundToLong
@@ -21,8 +22,8 @@ import kotlin.math.roundToLong
  *
  * The song is decoded here and fed to an AudioTrack, rather than played with MediaPlayer, because
  * AudioTrack reports exactly which frame is reaching the speaker at what moment (its output delay
- * included, which differs per phone), and lets us skip or insert frames to correct timing. That
- * works on every phone, unlike MediaPlayer speed changes, which many phones ignore.
+ * included, which differs per phone). Timing is corrected by briefly fading out, inserting silence
+ * or skipping a few ms, and fading back in. Playback speed is never changed.
  */
 class AudioSyncPlayer(private val context: Context) {
 
@@ -34,11 +35,15 @@ class AudioSyncPlayer(private val context: Context) {
         private const val TAG = "AudioSync"
         private const val LEAD_IN_MS = 600L          // start the output this early, on silence, to measure its delay
         private const val CHECK_EVERY_MS = 150L
-        private const val CHECKS_PER_DECISION = 5    // act on the median of 5 checks, not on single noisy ones
-        private const val DEAD_ZONE_MS = 2.0         // closer than this: leave it alone
+        private const val CHECKS_PER_DECISION = 7    // act on the median of ~1 s of checks, not on single noisy ones
+        private const val DEAD_ZONE_MS = 4.0         // closer than this: leave it alone
+        private const val MIN_CORRECTION_GAP_MS = 2000L
         private const val MAX_INSERT_MS = 3000.0
+        private const val FADE_MS = 3                // fade out/in around a correction so it doesn't click
         private const val TIMESTAMP_WAIT_MS = 2000L
         private const val CODEC_TIMEOUT_US = 10_000L
+        private const val QUIET_DECISIONS_PER_LOG = 5
+        private const val RATE_LOG_EVERY_MS = 30_000L
     }
 
     /** Checks that the file has an audio track we can decode. Returns false if it cannot be opened. */
@@ -48,6 +53,7 @@ class AudioSyncPlayer(private val context: Context) {
         return try {
             extractor.setDataSource(context, uri, null)
             if (findAudioTrack(extractor) < 0) {
+                SyncLog.add("Player: no audio track in the file")
                 false
             } else {
                 source = uri
@@ -55,6 +61,7 @@ class AudioSyncPlayer(private val context: Context) {
             }
         } catch (e: Exception) {
             Log.w(TAG, "Cannot open $uri", e)
+            SyncLog.add("Player: cannot open file: ${e.message}")
             false
         } finally {
             extractor.release()
@@ -83,7 +90,10 @@ class AudioSyncPlayer(private val context: Context) {
             try {
                 play(uri, targetTime, currentOffset, extraDelayMs, onDrift)
             } catch (e: Exception) {
-                if (!stopped) DebugUtils.logError("❌ Playback failed", e)
+                if (!stopped) {
+                    SyncLog.add("Player: playback failed: ${e.javaClass.simpleName}: ${e.message}")
+                    DebugUtils.logError("❌ Playback failed", e)
+                }
             }
         }.start()
     }
@@ -132,7 +142,12 @@ class AudioSyncPlayer(private val context: Context) {
                 AudioFormat.ENCODING_PCM_FLOAT -> 4
                 else -> 2
             }
-            val writer = Writer(sampleRate, channels * bytesPerSample)
+            SyncLog.add(
+                "Player: ${decoder.mime}, $sampleRate Hz, $channels ch, " +
+                    (if (encoding == AudioFormat.ENCODING_PCM_FLOAT) "float" else "${bytesPerSample * 8}-bit") +
+                    ", first frame at ${first.ptsUs / 1000} ms"
+            )
+            val writer = Writer(sampleRate, channels, bytesPerSample, encoding == AudioFormat.ENCODING_PCM_FLOAT)
 
             // Wait until shortly before the start, so the lead-in is short
             val localStart = targetTime - currentOffset() + extraDelayMs()
@@ -159,6 +174,8 @@ class AudioSyncPlayer(private val context: Context) {
                 .build()
             track = audioTrack
             writer.track = audioTrack
+            SyncLog.add("Player: output buffer ${audioTrack.bufferSizeInFrames * 1000L / sampleRate} ms")
+            val playStartedAt = System.currentTimeMillis()
             audioTrack.play()
 
             // Play silence until the output reports when its frames reach the speaker
@@ -173,8 +190,15 @@ class AudioSyncPlayer(private val context: Context) {
                 }
             }
             if (stopped) return
-            if (!haveTimestamp) {
-                DebugUtils.logWarning("⚠️ This phone doesn't report audio output timing; sync will be rough")
+            if (haveTimestamp) {
+                val latencyMs = (writer.written - ts.framePosition) * 1000 / sampleRate -
+                    (System.nanoTime() - ts.nanoTime) / 1_000_000
+                SyncLog.add(
+                    "Player: speaker timing after ${System.currentTimeMillis() - playStartedAt} ms, " +
+                        "output delay ≈ $latencyMs ms"
+                )
+            } else {
+                SyncLog.add("Player: WARNING this phone doesn't report speaker timing; sync will be rough")
                 ts.framePosition = audioTrack.playbackHeadPosition.toLong()
                 ts.nanoTime = System.nanoTime()
             }
@@ -186,12 +210,21 @@ class AudioSyncPlayer(private val context: Context) {
             val wantedAt = targetTime - currentOffset() + extraDelayMs() + firstSongFrame * 1000.0 / sampleRate
             val wantedWriteIndex = ts.framePosition + ((wantedAt - heardAt) * sampleRate / 1000).roundToLong()
             val gap = wantedWriteIndex - writer.written
-            if (gap > 0) writer.writeLeadIn(gap) else writer.drop(-gap)
+            SyncLog.add(
+                "Player: start " + (if (gap >= 0) "on time, ${gap * 1000 / sampleRate} ms more silence"
+                else "${-gap * 1000 / sampleRate} ms late, skipping ahead") +
+                    " (clock offset ${currentOffset()} ms, fine-tune ${extraDelayMs()} ms)"
+            )
+            if (gap > 0) writer.writeLeadIn(gap) else writer.skipAtStart(-gap)
             writer.writeSong(first.pcm)
 
             // Stream the rest, checking timing as we go
             val errors = ArrayList<Double>()
             var lastCheck = 0L
+            var lastCorrection = 0L
+            var quietDecisions = 0
+            var rateBase: LongArray? = null // [framePosition, nanoTime] when we started measuring the output rate
+            var lastRateLog = 0L
             while (!stopped) {
                 val chunk = decoder.next() ?: break
                 writer.writeSong(chunk.pcm)
@@ -200,6 +233,19 @@ class AudioSyncPlayer(private val context: Context) {
                 if (now - lastCheck < CHECK_EVERY_MS) continue
                 lastCheck = now
                 if (!audioTrack.getTimestamp(ts)) continue
+
+                // How fast the speaker really consumes frames, compared with the file's sample rate
+                val base = rateBase
+                if (base == null) {
+                    rateBase = longArrayOf(ts.framePosition, ts.nanoTime)
+                    lastRateLog = now
+                } else if (now - lastRateLog >= RATE_LOG_EVERY_MS) {
+                    lastRateLog = now
+                    val seconds = (ts.nanoTime - base[1]) / 1e9
+                    if (seconds > 0) {
+                        SyncLog.add("Player: speaker runs at ${"%.1f".format((ts.framePosition - base[0]) / seconds)} Hz (file $sampleRate Hz)")
+                    }
+                }
 
                 val presented = writer.songFrameAt(ts.framePosition)
                 if (presented == null) {
@@ -211,26 +257,41 @@ class AudioSyncPlayer(private val context: Context) {
                 errors.add((presented - expected) * 1000.0 / sampleRate)
                 if (errors.size < CHECKS_PER_DECISION) continue
 
-                val aheadMs = errors.sorted()[errors.size / 2]
+                val sorted = errors.sorted()
+                val aheadMs = sorted[sorted.size / 2]
                 errors.clear()
                 onDrift(aheadMs.roundToLong())
-                if (abs(aheadMs) > DEAD_ZONE_MS) {
-                    Log.d(TAG, "Off by ${"%.1f".format(aheadMs)} ms, correcting")
+
+                val describe = "drift ${"%+.1f".format(aheadMs)} ms " +
+                    "(checks ${"%+.0f".format(sorted.first())}..${"%+.0f".format(sorted.last())}, offset ${currentOffset()} ms)"
+                val waitedEnough = lastCorrection == 0L || now - lastCorrection >= MIN_CORRECTION_GAP_MS
+                if (abs(aheadMs) > DEAD_ZONE_MS && waitedEnough) {
                     val frames = (abs(aheadMs) * sampleRate / 1000).roundToLong()
                     if (aheadMs > 0) {
-                        writer.insertSilence(min(frames, (MAX_INSERT_MS * sampleRate / 1000).toLong()))
+                        val insert = min(frames, (MAX_INSERT_MS * sampleRate / 1000).toLong())
+                        writer.delayBy(insert)
+                        SyncLog.add("Player: $describe → wait ${insert * 1000 / sampleRate} ms")
                     } else {
-                        writer.drop(frames)
+                        writer.skipAhead(frames)
+                        SyncLog.add("Player: $describe → skip ${frames * 1000 / sampleRate} ms")
                     }
+                    lastCorrection = now
+                    quietDecisions = 0
+                } else if (++quietDecisions >= QUIET_DECISIONS_PER_LOG) {
+                    quietDecisions = 0
+                    SyncLog.add("Player: $describe, ok")
                 }
             }
 
             // Let what's queued play out. Wait by time: some phones reset the play position on stop()
             if (!stopped) {
+                SyncLog.add("Player: song finished")
                 val queuedMs = (writer.written - audioTrack.playbackHeadPosition) * 1000 / sampleRate
                 audioTrack.stop()
                 val doneAt = System.currentTimeMillis() + queuedMs + 200
                 while (!stopped && System.currentTimeMillis() < doneAt) Thread.sleep(50)
+            } else {
+                SyncLog.add("Player: stopped")
             }
         } finally {
             track = null
@@ -247,13 +308,24 @@ class AudioSyncPlayer(private val context: Context) {
 
     /**
      * Writes frames to the AudioTrack and remembers which song frame each written frame holds,
-     * so a reported output position can be turned back into a song position.
+     * so a reported output position can be turned back into a song position. Corrections are
+     * applied at the next buffer: fade out, insert silence or skip frames, fade back in.
      */
-    private inner class Writer(private val sampleRate: Int, private val frameSize: Int) {
+    private inner class Writer(
+        sampleRate: Int,
+        private val channels: Int,
+        private val bytesPerSample: Int,
+        private val isFloat: Boolean
+    ) {
+        private val frameSize = channels * bytesPerSample
+        private val fadeFrames = sampleRate * FADE_MS / 1000
         var track: AudioTrack? = null
         var written = 0L          // frames written to the track
         var nextSongFrame = 0L    // song frame of the next decoded frame
+        private var pendingInsert = 0L
         private var pendingDrop = 0L
+        private var dropping = false
+        private var fadeInDone = fadeFrames // < fadeFrames while a fade-in is in progress
         // Measurements are meaningless until the last correction has reached the speaker
         private var correctionHeardAt = Long.MAX_VALUE
         private val segments = ArrayDeque<LongArray>() // [write index, song frame, length]
@@ -264,32 +336,60 @@ class AudioSyncPlayer(private val context: Context) {
             correctionHeardAt = written
         }
 
-        fun insertSilence(frames: Long) {
-            segments.addLast(longArrayOf(written, nextSongFrame - frames, frames))
-            writeSilence(frames)
-            correctionHeardAt = written
+        /** Skip frames at the very start, when starting late; nothing has been heard yet, so no fade-out. */
+        fun skipAtStart(frames: Long) {
+            if (frames <= 0) return
+            pendingDrop = frames
+            dropping = true
+            correctionHeardAt = Long.MAX_VALUE
         }
 
-        fun drop(frames: Long) {
-            if (frames <= 0) return
-            pendingDrop += frames
+        /** Play [frames] later: fade out, silence, fade back in. */
+        fun delayBy(frames: Long) {
+            pendingInsert = frames
+            correctionHeardAt = Long.MAX_VALUE
+        }
+
+        /** Jump [frames] ahead: fade out, skip, fade back in. */
+        fun skipAhead(frames: Long) {
+            pendingDrop = frames
             correctionHeardAt = Long.MAX_VALUE
         }
 
         fun writeSong(pcm: ByteArray) {
             val frames = pcm.size / frameSize
-            val skip = min(pendingDrop, frames.toLong()).toInt()
-            nextSongFrame += skip
-            if (pendingDrop > 0) {
-                pendingDrop -= skip
-                if (pendingDrop == 0L) correctionHeardAt = written
+            var pos = 0
+            if ((pendingInsert > 0 || pendingDrop > 0) && !dropping) {
+                val fade = min(fadeFrames, frames)
+                ramp(pcm, 0, fade, 1f, 0f)
+                emit(pcm, 0, fade)
+                pos = fade
+                if (pendingInsert > 0) {
+                    segments.addLast(longArrayOf(written, nextSongFrame - pendingInsert, pendingInsert))
+                    writeSilence(pendingInsert)
+                    pendingInsert = 0
+                    startFadeIn()
+                } else {
+                    dropping = true
+                }
             }
-            val keep = frames - skip
-            if (keep <= 0) return
-            segments.addLast(longArrayOf(written, nextSongFrame, keep.toLong()))
-            write(pcm, skip * frameSize, keep * frameSize)
-            nextSongFrame += keep
-            written += keep
+            if (dropping) {
+                val skip = min(pendingDrop, (frames - pos).toLong()).toInt()
+                nextSongFrame += skip
+                pos += skip
+                pendingDrop -= skip
+                if (pendingDrop == 0L) {
+                    dropping = false
+                    startFadeIn()
+                }
+            }
+            if (pos >= frames) return
+            if (fadeInDone < fadeFrames) {
+                val fade = min(fadeFrames - fadeInDone, frames - pos)
+                ramp(pcm, pos, fade, fadeInDone.toFloat() / fadeFrames, (fadeInDone + fade).toFloat() / fadeFrames)
+                fadeInDone += fade
+            }
+            emit(pcm, pos, frames - pos)
         }
 
         /** Song frame being heard at output position [position], or null if we can't tell yet. */
@@ -299,6 +399,36 @@ class AudioSyncPlayer(private val context: Context) {
             val segment = segments.firstOrNull() ?: return null
             if (position < segment[0]) return null
             return segment[1] + (position - segment[0])
+        }
+
+        private fun startFadeIn() {
+            fadeInDone = 0
+            correctionHeardAt = written
+        }
+
+        private fun emit(pcm: ByteArray, startFrame: Int, count: Int) {
+            if (count <= 0) return
+            segments.addLast(longArrayOf(written, nextSongFrame, count.toLong()))
+            write(pcm, startFrame * frameSize, count * frameSize)
+            nextSongFrame += count
+            written += count
+        }
+
+        /** Scales [count] frames from [startFrame] by a gain going linearly from [from] to [to]. */
+        private fun ramp(pcm: ByteArray, startFrame: Int, count: Int, from: Float, to: Float) {
+            if (count <= 0 || (bytesPerSample != 2 && !isFloat)) return
+            val buffer = ByteBuffer.wrap(pcm).order(ByteOrder.nativeOrder())
+            for (i in 0 until count) {
+                val gain = from + (to - from) * i / count
+                for (c in 0 until channels) {
+                    val at = ((startFrame + i) * channels + c) * bytesPerSample
+                    if (isFloat) {
+                        buffer.putFloat(at, buffer.getFloat(at) * gain)
+                    } else {
+                        buffer.putShort(at, (buffer.getShort(at) * gain).toInt().toShort())
+                    }
+                }
+            }
         }
 
         private fun writeSilence(frames: Long) {
@@ -327,6 +457,7 @@ class AudioSyncPlayer(private val context: Context) {
         private val info = MediaCodec.BufferInfo()
         private var inputDone = false
         private var outputDone = false
+        val mime: String
         var outputFormat: MediaFormat
 
         init {
@@ -335,7 +466,8 @@ class AudioSyncPlayer(private val context: Context) {
             require(index >= 0) { "No audio track in $uri" }
             extractor.selectTrack(index)
             outputFormat = extractor.getTrackFormat(index)
-            codec = MediaCodec.createDecoderByType(outputFormat.getString(MediaFormat.KEY_MIME)!!)
+            mime = outputFormat.getString(MediaFormat.KEY_MIME)!!
+            codec = MediaCodec.createDecoderByType(mime)
             codec.configure(outputFormat, null, null, 0)
             codec.start()
         }

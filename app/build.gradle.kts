@@ -16,12 +16,25 @@ android {
         applicationId = "com.example.syncaudio"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        // CI sets GITHUB_RUN_NUMBER, so each release has its own number (matching its v1.0.N tag)
+        val buildNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull()
+        versionCode = buildNumber ?: 1
+        versionName = buildNumber?.let { "1.0.$it" } ?: "1.0-dev"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
+        }
+    }
+
+    signingConfigs {
+        getByName("debug") {
+            // Committed on purpose: every build gets the same signature, so a new release installs
+            // over the previous one. Debug-only; a Play Store release would need its own private key.
+            storeFile = file("syncaudio-debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
         }
     }
 
