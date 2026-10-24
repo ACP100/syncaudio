@@ -133,7 +133,9 @@ object NetworkUtils {
         return try {
             DebugUtils.log("🏓 Pinging $ipAddress with timeout ${timeout}ms")
             val address = InetAddress.getByName(ipAddress)
-            val result = address.isReachable(timeout)
+            // isReachable needs ICMP, which Android apps usually cannot send, so also ask
+            // the other phone's TimeSync port, which every phone running this app answers
+            val result = address.isReachable(timeout) || TimeSync.measureBestOffset(ipAddress, samples = 1) != null
             DebugUtils.log(if (result) "✅ $ipAddress is reachable" else "❌ $ipAddress is not reachable")
             result
         } catch (e: Exception) {

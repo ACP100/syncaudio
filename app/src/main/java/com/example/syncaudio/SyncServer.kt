@@ -60,6 +60,7 @@ object SyncServer {
 
                         if (message.contains("Hello")) {
                             DebugUtils.logSuccess("🤝 Client connected successfully!")
+                            AudioSyncManager.addPeer(clientAddress)
                             DebugUtils.log("📊 Total packets received: $packetCount")
                             DebugUtils.log("🏠 Server IP: ${InetAddress.getLocalHost().hostAddress}")
 

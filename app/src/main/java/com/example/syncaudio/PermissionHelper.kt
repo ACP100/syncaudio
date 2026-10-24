@@ -18,13 +18,11 @@ object PermissionHelper {
             Manifest.permission.INTERNET,
             Manifest.permission.ACCESS_NETWORK_STATE,
             Manifest.permission.ACCESS_FINE_LOCATION,  // Required for Wi-Fi Direct
-            Manifest.permission.ACCESS_COARSE_LOCATION, // Required for Wi-Fi Direct
-            Manifest.permission.NEARBY_WIFI_DEVICES    // For Android 13+
+            Manifest.permission.ACCESS_COARSE_LOCATION  // Required for Wi-Fi Direct
         ).apply {
-            // Add Bluetooth permissions for some Wi-Fi Direct operations
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                add(Manifest.permission.BLUETOOTH_SCAN)
-                add(Manifest.permission.BLUETOOTH_CONNECT)
+            // NEARBY_WIFI_DEVICES only exists on Android 13+; on older versions it always reads as denied
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                add(Manifest.permission.NEARBY_WIFI_DEVICES)
             }
         }.toTypedArray()
 

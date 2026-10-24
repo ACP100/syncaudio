@@ -3,12 +3,16 @@ package com.example.syncaudio
 
 import android.content.Context
 import android.net.Uri
+import android.net.wifi.WifiManager
 import android.provider.OpenableColumns
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.Inet4Address
 import java.net.InetAddress
+import java.net.NetworkInterface
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Plays the same track on every phone at the same instant.
@@ -27,6 +31,15 @@ object AudioSyncManager {
     private var listenerSocket: DatagramSocket? = null
 
     private var context: Context? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
+
+    // Phones seen via the connect handshake. Play is also sent straight to them, because many
+    // Wi-Fi drivers and hotspots drop broadcast packets.
+    private val peers = ConcurrentHashMap.newKeySet<String>()
+
+    fun addPeer(ip: String) {
+        if (peers.add(ip)) DebugUtils.log("🤝 Added sync peer $ip")
+    }
 
     // Target time of the last command seen, so a rebroadcast or our own echo is only played once.
     @Volatile private var lastTargetSeen = -1L
@@ -40,6 +53,17 @@ object AudioSyncManager {
         isListening = true
 
         TimeSync.startServer() // this phone is a clock reference for the others
+
+        // Without this lock many phones silently discard incoming broadcast packets
+        try {
+            val wifi = context?.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            multicastLock = wifi?.createMulticastLock("syncaudio")?.apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (e: Exception) {
+            DebugUtils.logWarning("⚠️ Could not acquire multicast lock: ${e.message}")
+        }
 
         Thread {
             try {
@@ -61,6 +85,7 @@ object AudioSyncManager {
 
                     lastTargetSeen = targetTime
                     val serverIp = packet.address.hostAddress ?: continue
+                    addPeer(serverIp)
 
                     // Handle off the receive loop, so a slow clock sync cannot stall the listener
                     val trackName = parts[1]
@@ -78,6 +103,8 @@ object AudioSyncManager {
     fun stopListening() {
         isListening = false
         listenerSocket?.close()
+        multicastLock?.release()
+        multicastLock = null
     }
 
     /** Runs on a listening phone when a PLAY command arrives. */
@@ -149,10 +176,24 @@ object AudioSyncManager {
     }
 
     private fun sendBroadcast(message: ByteArray) {
-        val targets = mutableListOf("255.255.255.255")
-        context?.let { NetworkUtils.getLocalIpAddress(it) }
-            ?.let { NetworkUtils.getBroadcastAddress(it) }
-            ?.let { targets.add(it) }
+        val targets = linkedSetOf("255.255.255.255")
+        // Broadcast on every interface: on a phone hosting a hotspot, 255.255.255.255 often
+        // leaves through mobile data instead of the hotspot
+        try {
+            for (iface in NetworkInterface.getNetworkInterfaces()) {
+                if (!iface.isUp || iface.isLoopback) continue
+                for (ifaceAddr in iface.interfaceAddresses) {
+                    if (ifaceAddr.address is Inet4Address) {
+                        ifaceAddr.broadcast?.hostAddress?.let { targets.add(it) }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            DebugUtils.logWarning("⚠️ Could not list network interfaces: ${e.message}")
+        }
+        targets.addAll(peers)
+        ConnectionManager.connectionStatus.value.serverIp.takeIf { it.isNotEmpty() }?.let { targets.add(it) }
+        DebugUtils.log("📡 Sending PLAY to: ${targets.joinToString()}")
 
         val socket = DatagramSocket()
         try {

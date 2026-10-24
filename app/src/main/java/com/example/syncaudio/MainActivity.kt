@@ -121,16 +121,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun checkNetworkPermissions() {
-        val permissions = listOf(
-            android.Manifest.permission.INTERNET,
-            android.Manifest.permission.ACCESS_NETWORK_STATE,
-            android.Manifest.permission.ACCESS_WIFI_STATE,
-            android.Manifest.permission.CHANGE_WIFI_STATE,
-            android.Manifest.permission.ACCESS_FINE_LOCATION,
-            android.Manifest.permission.ACCESS_COARSE_LOCATION
-        )
-
-        permissions.forEach { permission ->
+        PermissionHelper.REQUIRED_PERMISSIONS.forEach { permission ->
             val granted = ContextCompat.checkSelfPermission(this, permission) ==
                     PackageManager.PERMISSION_GRANTED
             DebugUtils.log("${if (granted) "✅" else "❌"} $permission: ${if (granted) "GRANTED" else "DENIED"}")

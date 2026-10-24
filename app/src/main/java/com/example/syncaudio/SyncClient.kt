@@ -70,9 +70,10 @@ object SyncClient {
                     try {
                         val serverAddressObj = InetAddress.getByName(serverIp)
                         DebugUtils.log("📍 Server address resolved: $serverAddressObj")
-                        success = sendAndReceive(socket, serverAddressObj, serverIp)
+                        val responder = sendAndReceive(socket, serverAddressObj, serverIp)
+                        success = responder != null
                         if (success) {
-                            serverAddress = serverIp
+                            serverAddress = responder!!
                             serverPort = PORT
                         }
                     } catch (e: Exception) {
@@ -114,9 +115,10 @@ object SyncClient {
                             val serverAddressObj = InetAddress.getByName(address)
                             DebugUtils.log("📍 Address resolved to: $serverAddressObj")
 
-                            if (sendAndReceive(socket, serverAddressObj, address)) {
-                                DebugUtils.logSuccess("✅ Connection successful with $address")
-                                serverAddress = address
+                            val responder = sendAndReceive(socket, serverAddressObj, address)
+                            if (responder != null) {
+                                DebugUtils.logSuccess("✅ Server $responder answered broadcast $address")
+                                serverAddress = responder
                                 serverPort = PORT
                                 success = true
                                 break // Stop if successful
@@ -160,7 +162,7 @@ object SyncClient {
         }.start()
     }
 
-    private fun sendAndReceive(socket: DatagramSocket, serverAddress: InetAddress, addressName: String): Boolean {
+    private fun sendAndReceive(socket: DatagramSocket, serverAddress: InetAddress, addressName: String): String? {
         val message = "Hello Server from SyncAudio - Attempt $connectionAttempts".toByteArray()
         val packet = DatagramPacket(message, message.size, serverAddress, PORT)
 
@@ -192,7 +194,8 @@ object SyncClient {
 
             if (response.contains("ACK")) {
                 DebugUtils.logSuccess("✅ Server connection established successfully!")
-                return true
+                AudioSyncManager.addPeer(responseAddress)
+                return responseAddress
             }
 
         } catch (e: java.net.SocketTimeoutException) {
@@ -200,7 +203,7 @@ object SyncClient {
             throw e // Re-throw to try next address
         }
 
-        return false
+        return null
     }
 
     fun resetConnectionAttempts() {
