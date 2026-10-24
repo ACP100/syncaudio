@@ -17,6 +17,7 @@ import androidx.core.content.ContextCompat
 import android.net.wifi.p2p.WifiP2pManager
 import android.net.wifi.p2p.WifiP2pDevice
 import android.content.IntentFilter
+import com.example.syncaudio.composables.SimpleSyncScreen
 import com.example.syncaudio.composables.SyncAudioTestUI
 
 
@@ -57,15 +58,22 @@ class MainActivity : ComponentActivity() {
         checkNetworkPermissions()
 
         DebugUtils.log("🚀 MainActivity created")
-        Toast.makeText(this, "Sync Audio Testing App Started!", Toast.LENGTH_SHORT).show()
-
+        
         setContent {
             MaterialTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    SyncAudioTestUI()
+                    var showAdvanced by remember { mutableStateOf(false) }
+                    if (showAdvanced) {
+                        Column {
+                            TextButton(onClick = { showAdvanced = false }) { Text("← Back to simple mode") }
+                            SyncAudioTestUI()
+                        }
+                    } else {
+                        SimpleSyncScreen(onOpenAdvanced = { showAdvanced = true })
+                    }
                 }
             }
         }
