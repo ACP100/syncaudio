@@ -67,7 +67,7 @@ fun AudioPlayerSection(
                             withContext(Dispatchers.Main) {
                                 val player = localPlayer
                                 if (player != null) {
-                                    player.playAtTimestamp(System.currentTimeMillis(), 0L)
+                                    player.playAtTimestamp(System.currentTimeMillis() + 700L, 0L) // room for the output lead-in
                                     onStatusUpdate("▶️ Playing locally")
                                 } else {
                                     onStatusUpdate("⚠️ Cannot play: Load audio first")

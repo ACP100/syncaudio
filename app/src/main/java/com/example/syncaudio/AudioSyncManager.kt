@@ -29,7 +29,8 @@ import java.util.concurrent.ConcurrentHashMap
 object AudioSyncManager {
 
     private const val SYNC_PORT = 5004 // separate port for audio commands
-    private const val MAX_LATE_MS = 50L // starting this much later than planned is audibly out of sync
+    // The player can start late in sync by skipping ahead; past this, the song would start noticeably cut
+    private const val MAX_LATE_MS = 1500L
 
     @Volatile private var isListening = false
     private var listenerSocket: DatagramSocket? = null
