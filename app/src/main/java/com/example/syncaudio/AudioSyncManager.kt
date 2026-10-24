@@ -4,6 +4,7 @@ package com.example.syncaudio
 import android.content.Context
 import android.net.Uri
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.provider.OpenableColumns
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -35,13 +36,15 @@ object AudioSyncManager {
 
     private var context: Context? = null
     private var multicastLock: WifiManager.MulticastLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     // Phones seen via the connect handshake. Play is also sent straight to them, because many
     // Wi-Fi drivers and hotspots drop broadcast packets.
     private val peers = ConcurrentHashMap.newKeySet<String>()
 
     private const val SYNC_SERVER_PORT = 5001 // SyncServer, which also answers POLL
-    private const val POLL_INTERVAL_MS = 250L
+    private const val POLL_INTERVAL_MS = 100L
+    private const val POLL_SAMPLES_KEPT = 150 // 15 s of samples at POLL_INTERVAL_MS
 
     // Play command the server phone is currently offering to pollers: "<track name>|<target time>"
     @Volatile var currentPlay: String? = null
@@ -114,6 +117,7 @@ object AudioSyncManager {
         isHosting = true
         SyncServer.start()
         SongServer.start(ctx)
+        holdLowLatencyWifi(true)
         setStatus("Hosting. Pick a song, then press Play for everyone.")
     }
 
@@ -122,6 +126,7 @@ object AudioSyncManager {
         isHosting = false
         SyncServer.stop()
         SongServer.stop()
+        holdLowLatencyWifi(false)
         setStatus("Idle")
     }
 
@@ -131,6 +136,7 @@ object AudioSyncManager {
         manualHostIp = hostIp?.trim()?.takeIf { it.isNotEmpty() }
         lastConnectAttempt = 0L
         isJoining = true
+        holdLowLatencyWifi(true)
         ConnectionManager.updateConnection(isConnected = false)
         setStatus(manualHostIp?.let { "Connecting to $it…" } ?: "Looking for a host on this network…")
     }
@@ -139,8 +145,37 @@ object AudioSyncManager {
         isJoining = false
         lastRemoteStopSeq = -1
         stopHere()
+        holdLowLatencyWifi(false)
         ConnectionManager.updateConnection(isConnected = false)
         setStatus("Idle")
+    }
+
+    /**
+     * Wi-Fi power saving parks the radio between beacons, delaying packets by a random few to
+     * 100 ms. That skews every clock sample, so keep Wi-Fi awake while hosting or joining.
+     */
+    @Suppress("DEPRECATION")
+    private fun holdLowLatencyWifi(on: Boolean) {
+        try {
+            if (!on) {
+                wifiLock?.release()
+                wifiLock = null
+                return
+            }
+            if (wifiLock?.isHeld == true) return
+            val wifi = context?.getSystemService(Context.WIFI_SERVICE) as? WifiManager ?: return
+            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            } else {
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF
+            }
+            wifiLock = wifi.createWifiLock(mode, "syncaudio:sync").apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (e: Exception) {
+            DebugUtils.logWarning("⚠️ Could not keep Wi-Fi in low-latency mode: ${e.message}")
+        }
     }
 
     /** Stop on this phone and tell joined phones to stop too. */
@@ -330,13 +365,23 @@ object AudioSyncManager {
     private fun addPollSample(offset: Long, roundTrip: Long) {
         synchronized(pollSamples) {
             pollSamples.addLast(offset to roundTrip)
-            while (pollSamples.size > 20) pollSamples.removeFirst()
+            while (pollSamples.size > POLL_SAMPLES_KEPT) pollSamples.removeFirst()
         }
     }
 
-    /** Lowest-round-trip recent POLL sample as (offset, round trip), or null if none yet. */
-    private fun bestPollSample(): Pair<Long, Long>? =
-        synchronized(pollSamples) { pollSamples.minByOrNull { it.second } }
+    /**
+     * Clock offset from recent POLL samples as (offset, round trip), or null if none yet.
+     * Uses the median offset of the 5 fastest round trips: fast samples are the least skewed by
+     * queuing delay, and the median keeps one lucky outlier from moving the estimate.
+     */
+    private fun bestPollSample(): Pair<Long, Long>? {
+        synchronized(pollSamples) {
+            if (pollSamples.isEmpty()) return null
+            val fastest = pollSamples.sortedBy { it.second }.take(5)
+            val offsets = fastest.map { it.first }.sorted()
+            return offsets[offsets.size / 2] to fastest.first().second
+        }
+    }
 
     fun stopListening() {
         isListening = false
@@ -393,7 +438,8 @@ object AudioSyncManager {
             targetTime,
             offset,
             currentOffset = { bestPollSample()?.takeIf { polledFrom(serverIp) }?.first ?: offset },
-            extraDelayMs = { adjustMs }
+            extraDelayMs = { adjustMs },
+            onDrift = { aheadMs -> _status.value = "▶️ Playing '$localName' · ${kotlin.math.abs(aheadMs)} ms from the host" }
         )
     }
 

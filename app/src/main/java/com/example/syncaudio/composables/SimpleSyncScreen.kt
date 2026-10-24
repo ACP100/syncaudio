@@ -164,8 +164,8 @@ private fun FineTune() {
     }
     Text("Still hear an echo? Fine-tune this phone:", fontSize = 13.sp, textAlign = TextAlign.Center)
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        OutlinedButton(onClick = { set(adjust - 20) }) { Text("◀ Earlier") }
+        OutlinedButton(onClick = { set(adjust - 5) }) { Text("◀ Earlier") }
         Text("${if (adjust > 0) "+" else ""}$adjust ms", modifier = Modifier.widthIn(min = 64.dp), textAlign = TextAlign.Center)
-        OutlinedButton(onClick = { set(adjust + 20) }) { Text("Later ▶") }
+        OutlinedButton(onClick = { set(adjust + 5) }) { Text("Later ▶") }
     }
 }

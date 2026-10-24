@@ -14,10 +14,14 @@ class AudioSyncPlayer(private val context: Context) {
     @Volatile private var player: MediaPlayer? = null
 
     companion object {
-        private const val CHECK_INTERVAL_MS = 300L
+        private const val CHECK_INTERVAL_MS = 200L
+        private const val CHECKS_PER_DECISION = 5  // act on the median of 5 checks, not on single noisy ones
         private const val SEEK_THRESHOLD_MS = 150L // further off than this: jump
-        private const val NUDGE_THRESHOLD_MS = 8L  // closer than this: leave it alone
-        private const val NUDGE_SPEED = 0.05f      // play 5% fast or slow to close small gaps
+        private const val NUDGE_THRESHOLD_MS = 3L  // closer than this: leave it alone
+        private const val SMALL_NUDGE = 0.02f      // play 2% fast or slow to close small gaps
+        private const val BIG_NUDGE = 0.05f        // 5% for gaps over BIG_NUDGE_FROM_MS
+        private const val BIG_NUDGE_FROM_MS = 40L
+        private const val SETTLE_AFTER_SEEK_MS = 500L
     }
 
     /** Prepares the file so that start() has no decoding delay later. Returns false if it cannot be opened. */
@@ -38,14 +42,15 @@ class AudioSyncPlayer(private val context: Context) {
         targetTime: Long,
         offset: Long,
         currentOffset: () -> Long = { offset },
-        extraDelayMs: () -> Long = { 0L }
+        extraDelayMs: () -> Long = { 0L },
+        onDrift: (Long) -> Unit = {}
     ) {
         val localTarget = targetTime - offset
         Log.d("AudioSync", "Scheduled playback in ${localTarget - System.currentTimeMillis()} ms (offset=$offset)")
 
         waitUntil(localTarget)
         player?.start()
-        Thread { keepInSync(targetTime, currentOffset, extraDelayMs) }.start()
+        Thread { keepInSync(targetTime, currentOffset, extraDelayMs, onDrift) }.start()
     }
 
     /**
@@ -54,8 +59,14 @@ class AudioSyncPlayer(private val context: Context) {
      * reaching the speaker (MediaPlayer timestamp) with where the shared host clock says the song should
      * be, then jump when far off and briefly play faster or slower when slightly off.
      */
-    private fun keepInSync(targetTime: Long, currentOffset: () -> Long, extraDelayMs: () -> Long) {
-        var nudgeUntil = 0L
+    private fun keepInSync(
+        targetTime: Long,
+        currentOffset: () -> Long,
+        extraDelayMs: () -> Long,
+        onDrift: (Long) -> Unit
+    ) {
+        val recent = ArrayList<Long>()
+        var busyUntil = 0L // while a nudge or seek is in progress, measurements are meaningless
         try {
             while (true) {
                 Thread.sleep(CHECK_INTERVAL_MS)
@@ -66,12 +77,13 @@ class AudioSyncPlayer(private val context: Context) {
                 }
 
                 val now = System.currentTimeMillis()
-                if (nudgeUntil != 0L && now >= nudgeUntil) {
+                if (busyUntil != 0L) {
+                    if (now < busyUntil) continue
                     setSpeed(mp, 1f)
-                    nudgeUntil = 0L
+                    busyUntil = 0L
+                    recent.clear()
                     continue // let the speed change settle before measuring again
                 }
-                if (nudgeUntil != 0L) continue
 
                 val ts = mp.timestamp ?: continue
                 if (ts.mediaClockRate == 0f) continue
@@ -79,17 +91,24 @@ class AudioSyncPlayer(private val context: Context) {
                 val anchorNs = ts.anchorSytemNanoTime
                 val actualMs = (ts.anchorMediaTimeUs + (System.nanoTime() - anchorNs) / 1000 * ts.mediaClockRate) / 1000
                 val expectedMs = now + currentOffset() - targetTime - extraDelayMs()
-                val aheadMs = (actualMs - expectedMs).toLong()
+                recent.add((actualMs - expectedMs).toLong())
+                if (recent.size < CHECKS_PER_DECISION) continue
+
+                val aheadMs = recent.sorted()[recent.size / 2]
+                recent.clear()
+                onDrift(aheadMs)
 
                 when {
                     abs(aheadMs) > SEEK_THRESHOLD_MS -> {
                         Log.d("AudioSync", "Off by $aheadMs ms, seeking")
-                        seekTo(mp, expectedMs.toLong() + CHECK_INTERVAL_MS / 2)
+                        seekTo(mp, mp.currentPosition - aheadMs)
+                        busyUntil = now + SETTLE_AFTER_SEEK_MS
                     }
                     abs(aheadMs) > NUDGE_THRESHOLD_MS -> {
-                        Log.d("AudioSync", "Off by $aheadMs ms, nudging speed")
-                        setSpeed(mp, if (aheadMs > 0) 1f - NUDGE_SPEED else 1f + NUDGE_SPEED)
-                        nudgeUntil = now + (abs(aheadMs) / NUDGE_SPEED).toLong()
+                        val nudge = if (abs(aheadMs) > BIG_NUDGE_FROM_MS) BIG_NUDGE else SMALL_NUDGE
+                        Log.d("AudioSync", "Off by $aheadMs ms, nudging speed by $nudge")
+                        setSpeed(mp, if (aheadMs > 0) 1f - nudge else 1f + nudge)
+                        busyUntil = now + (abs(aheadMs) / nudge).toLong()
                     }
                 }
             }
