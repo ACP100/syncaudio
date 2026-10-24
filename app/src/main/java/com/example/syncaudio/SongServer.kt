@@ -22,47 +22,31 @@ object SongServer {
         val appContext = context.applicationContext
 
         Thread {
-            var socket: ServerSocket? = null
             try {
-                socket = ServerSocket(PORT)
-                serverSocket = socket
-                SyncLog.add("Host: song server listening on port $PORT")
-                while (running && serverSocket === socket) {
-                    val client = socket.accept()
+                serverSocket = ServerSocket(PORT)
+                DebugUtils.logSuccess("✅ Song server listening on port $PORT")
+                while (running) {
+                    val client = serverSocket?.accept() ?: break
                     Thread { serve(appContext, client) }.start()
                 }
             } catch (e: Exception) {
-                if (running && serverSocket === socket) {
-                    SyncLog.add("Host: song server failed: ${e.javaClass.simpleName}: ${e.message}")
-                }
+                if (running) DebugUtils.logError("❌ Song server error", e)
             } finally {
-                socket?.close()
-                // Only reset if a newer start() hasn't replaced this server meanwhile; closing the
-                // shared field here used to kill the new server after Leave + Host
-                if (serverSocket === socket) {
-                    serverSocket = null
-                    running = false
-                }
+                running = false
+                serverSocket?.close()
             }
         }.start()
     }
 
     fun stop() {
         running = false
-        val socket = serverSocket
-        serverSocket = null // so the old thread's cleanup can't mistake a newer server for its own
-        socket?.close()
+        serverSocket?.close()
     }
 
     private fun serve(context: Context, client: Socket) {
         try {
             client.use {
-                val uri = FileSelectionManager.getSelectedFile()
-                if (uri == null) {
-                    SyncLog.add("Host: ${client.inetAddress.hostAddress} asked for the song, but none is picked")
-                    return
-                }
-                SyncLog.add("Host: sending song to ${client.inetAddress.hostAddress}")
+                val uri = FileSelectionManager.getSelectedFile() ?: return
                 val bytes = context.contentResolver.openInputStream(uri)?.use { input -> input.readBytes() } ?: return
                 val name = AudioSyncManager.trackName(context, uri).toByteArray()
 
@@ -72,10 +56,10 @@ object SongServer {
                 out.writeLong(bytes.size.toLong())
                 out.write(bytes)
                 out.flush()
-                SyncLog.add("Host: sent song to ${client.inetAddress.hostAddress} (${bytes.size / 1024} KB)")
+                DebugUtils.logSuccess("✅ Sent song to ${client.inetAddress.hostAddress} (${bytes.size} bytes)")
             }
         } catch (e: Exception) {
-            SyncLog.add("Host: failed to send song to ${client.inetAddress.hostAddress}: ${e.javaClass.simpleName}: ${e.message}")
+            DebugUtils.logError("❌ Failed to send song to ${client.inetAddress.hostAddress}", e)
         }
     }
 }

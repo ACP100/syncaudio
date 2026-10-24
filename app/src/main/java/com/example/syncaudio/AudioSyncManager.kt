@@ -96,17 +96,10 @@ object AudioSyncManager {
         val now = System.currentTimeMillis()
         val seq = request.substringAfter("POLL|", "0")
         val lastSeen = joinedPhones.put(fromIp, now)
-        if (lastSeen == null || now - lastSeen > 3000) {
-            SyncLog.add("Host: phone $fromIp is polling")
-            if (!request.startsWith("POLL|")) {
-                setStatus("⚠️ Phone $fromIp runs an older SyncAudio. Install ${appVersionLabel()} on every phone.")
-            }
-        }
+        if (lastSeen == null || now - lastSeen > 3000) SyncLog.add("Host: phone $fromIp is polling")
         val target = currentPlayTarget.takeIf { it > now } ?: 0L
         return "STATE|$seq|$now|${hostSongName()}|$target|$stopSeq"
     }
-
-    private fun appVersionLabel(): String = context?.let { "v" + SyncLog.appVersion(it) } ?: "the same version"
 
     /** Phones that polled within the last few seconds. */
     fun joinedPhoneCount(): Int {
@@ -210,7 +203,6 @@ object AudioSyncManager {
         val ctx = context ?: return
         downloading = true
         lastDownloadAttempt = System.currentTimeMillis()
-        SyncLog.add("Join: downloading '$song' from $hostIp:5003")
         setStatus("⬇️ Getting '$song' from the host…")
         var lastPercent = -1
         try {
@@ -314,8 +306,6 @@ object AudioSyncManager {
         var polls = 0
         var timeouts = 0
         var stale = 0
-        var missedInARow = 0
-        var warnedOldHost = false
         var seq = 0
         val buffer = ByteArray(1024)
         val reply = DatagramPacket(buffer, buffer.size)
@@ -357,23 +347,12 @@ object AudioSyncManager {
                     socket.receive(reply)
                     t3 = System.currentTimeMillis()
                     parts = String(reply.data, 0, reply.length).split("|")
-                    // v1.0.8 and older hosts reply "STATE|<host now>|<song>|<target>|<stop seq>", without the seq
-                    val fromOldHost = parts.size == 5 && parts[0] == "STATE"
                     val answersThisPoll = parts.getOrNull(1) == seq.toString()
-                    if (!answersThisPoll && !fromOldHost) stale++
-                } while (!answersThisPoll && !fromOldHost)
-                missedInARow = 0
-                if (parts.size == 5) {
-                    if (!warnedOldHost) {
-                        warnedOldHost = true
-                        setStatus("⚠️ The host runs an older SyncAudio. Install ${appVersionLabel()} on every phone.")
-                    }
-                    Thread.sleep(1000)
-                    continue
-                }
+                    if (!answersThisPoll) stale++
+                } while (!answersThisPoll)
 
                 // "STATE|<seq>|<host now>|<song name>|<target or 0>|<stop seq>"
-                if (parts.size >= 6 && parts[0] == "STATE") {
+                if (parts.size == 6 && parts[0] == "STATE") {
                     parts[2].toLongOrNull()?.let { hostNow -> addPollSample(hostNow - (t0 + t3) / 2, t3 - t0) }
                     if (++polls % 50 == 0) logClock(t3 - t0, timeouts, stale)
                     val song = parts[3]
@@ -402,9 +381,6 @@ object AudioSyncManager {
             } catch (e: java.net.SocketTimeoutException) {
                 // Server didn't answer this round; try again
                 timeouts++
-                if (++missedInARow == 10 || missedInARow % 100 == 0) {
-                    SyncLog.add("Join: host $polledIp not answering ($missedInARow polls in a row)")
-                }
             } catch (e: Exception) {
                 DebugUtils.logWarning("⚠️ Poll failed: ${e.message}")
                 socket?.close()
