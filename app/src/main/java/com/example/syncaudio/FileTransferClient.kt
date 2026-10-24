@@ -74,6 +74,7 @@ class FileTransferClient(
 
             } catch (e: Exception) {
                 DebugUtils.logError("❌ Error downloading file from $serverIp:$port", e)
+                SyncLog.add("Join: download from $serverIp:$port failed: ${e.javaClass.simpleName}: ${e.message}")
             }
         }
     }
