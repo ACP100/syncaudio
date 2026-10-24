@@ -52,7 +52,7 @@ class AudioSyncPlayer(private val context: Context) {
             if (leftNs > 2_000_000L) {
                 Thread.sleep((leftNs - 1_000_000L) / 1_000_000L)
             } else {
-                Thread.onSpinWait()
+                Thread.yield() // Thread.onSpinWait() needs API 34; minSdk is 24
             }
         }
     }
