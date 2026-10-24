@@ -154,7 +154,8 @@ object TimeSync {
             try {
                 DebugUtils.log("🧪 Testing local time sync...")
 
-                // First start the server
+                // First start the server, remembering whether it was already serving peers
+                val wasRunning = serverRunning
                 startServer()
                 Thread.sleep(1000) // Wait for server to start
 
@@ -162,11 +163,10 @@ object TimeSync {
                 val offset = getOffset("127.0.0.1")
                 DebugUtils.logSuccess("✅ Local sync test passed! Offset: $offset ms")
 
-                // Stop the server
-                stopServer()
+                // Stop the server only if this test started it; other phones rely on it
+                if (!wasRunning) stopServer()
             } catch (e: Exception) {
                 DebugUtils.logError("❌ Local sync test failed: ${e.message}")
-                stopServer()
             }
         }.start()
     }

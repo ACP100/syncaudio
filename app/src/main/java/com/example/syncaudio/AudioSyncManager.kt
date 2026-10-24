@@ -6,6 +6,9 @@ import android.net.Uri
 import android.net.wifi.WifiManager
 import android.provider.OpenableColumns
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -36,6 +39,32 @@ object AudioSyncManager {
     // Phones seen via the connect handshake. Play is also sent straight to them, because many
     // Wi-Fi drivers and hotspots drop broadcast packets.
     private val peers = ConcurrentHashMap.newKeySet<String>()
+
+    private const val SYNC_SERVER_PORT = 5001 // SyncServer, which also answers POLL
+    private const val POLL_INTERVAL_MS = 250L
+
+    // Play command the server phone is currently offering to pollers: "<track name>|<target time>"
+    @Volatile var currentPlay: String? = null
+        private set
+    @Volatile private var currentPlayTarget = 0L
+
+    // Clock samples from POLL replies: (offset, round trip). The lowest round trip is the most accurate.
+    private val pollSamples = ArrayDeque<Pair<Long, Long>>()
+
+    private val _status = MutableStateFlow("Idle")
+    val status: StateFlow<String> = _status.asStateFlow()
+
+    private fun setStatus(text: String) {
+        _status.value = text
+        DebugUtils.log("🎵 $text")
+    }
+
+    /** What SyncServer replies to a POLL: "STATE|<server now>|<track>|<target>" or "STATE|<server now>|NONE". */
+    fun pollReply(): String {
+        val now = System.currentTimeMillis()
+        val play = currentPlay?.takeIf { currentPlayTarget > now }
+        return "STATE|$now|${play ?: "NONE"}"
+    }
 
     fun addPeer(ip: String) {
         if (peers.add(ip)) DebugUtils.log("🤝 Added sync peer $ip")
@@ -98,7 +127,78 @@ object AudioSyncManager {
                 listenerSocket?.close()
             }
         }.start()
+
+        Thread { pollLoop() }.start()
     }
+
+    /**
+     * While connected to a server, ask it every POLL_INTERVAL_MS whether a play is scheduled.
+     * Pushed PLAY packets are often dropped by routers and hotspots, but replies to a request
+     * the client sent itself get through, as the connect handshake shows.
+     */
+    private fun pollLoop() {
+        var socket: DatagramSocket? = null
+        var polledIp = ""
+        while (isListening) {
+            try {
+                val serverIp = ConnectionManager.connectionStatus.value
+                    .takeIf { it.isConnected }?.serverIp.orEmpty()
+                if (serverIp.isEmpty()) {
+                    Thread.sleep(500)
+                    continue
+                }
+                if (serverIp != polledIp) {
+                    polledIp = serverIp
+                    synchronized(pollSamples) { pollSamples.clear() }
+                    setStatus("Connected to $serverIp, waiting for play")
+                }
+                if (socket == null) socket = DatagramSocket().apply { soTimeout = 500 }
+
+                val request = "POLL".toByteArray()
+                val t0 = System.currentTimeMillis()
+                socket.send(DatagramPacket(request, request.size, InetAddress.getByName(serverIp), SYNC_SERVER_PORT))
+                val buffer = ByteArray(1024)
+                val reply = DatagramPacket(buffer, buffer.size)
+                socket.receive(reply)
+                val t3 = System.currentTimeMillis()
+
+                // "STATE|<server now>|<track>|<target>" or "STATE|<server now>|NONE"
+                val parts = String(reply.data, 0, reply.length).split("|")
+                if (parts.size >= 3 && parts[0] == "STATE") {
+                    val serverNow = parts[1].toLongOrNull()
+                    if (serverNow != null) {
+                        addPollSample(serverNow - (t0 + t3) / 2, t3 - t0)
+                    }
+                    val targetTime = parts.getOrNull(3)?.toLongOrNull()
+                    if (parts.size == 4 && targetTime != null && targetTime != lastTargetSeen) {
+                        lastTargetSeen = targetTime
+                        val trackName = parts[2]
+                        Thread { handlePlay(trackName, targetTime, serverIp) }.start()
+                    }
+                }
+                Thread.sleep(POLL_INTERVAL_MS)
+            } catch (e: java.net.SocketTimeoutException) {
+                // Server didn't answer this round; try again
+            } catch (e: Exception) {
+                DebugUtils.logWarning("⚠️ Poll failed: ${e.message}")
+                socket?.close()
+                socket = null
+                try { Thread.sleep(1000) } catch (ie: InterruptedException) {}
+            }
+        }
+        socket?.close()
+    }
+
+    private fun addPollSample(offset: Long, roundTrip: Long) {
+        synchronized(pollSamples) {
+            pollSamples.addLast(offset to roundTrip)
+            while (pollSamples.size > 20) pollSamples.removeFirst()
+        }
+    }
+
+    /** Lowest-round-trip recent POLL sample as (offset, round trip), or null if none yet. */
+    private fun bestPollSample(): Pair<Long, Long>? =
+        synchronized(pollSamples) { pollSamples.minByOrNull { it.second } }
 
     fun stopListening() {
         isListening = false
@@ -112,7 +212,7 @@ object AudioSyncManager {
         val ctx = context ?: return
         val localFile = FileSelectionManager.getSelectedFile()
         if (localFile == null) {
-            DebugUtils.logWarning("⚠️ No track selected on this phone, cannot play '$trackName'")
+            setStatus("⚠️ Server played '$trackName' but no song is selected on this phone. Pick the same song.")
             return
         }
 
@@ -123,14 +223,14 @@ object AudioSyncManager {
 
         val player = AudioSyncPlayer(ctx)
         if (!player.loadAudio(localFile)) {
-            DebugUtils.logError("❌ Could not open '$localName' for playback")
+            setStatus("❌ Could not open '$localName' for playback")
             return
         }
 
         // Measure after loading, so the decode time does not eat into the clock sample
-        val measured = TimeSync.measureBestOffset(serverIp)
+        val measured = bestPollSample()?.takeIf { polledFrom(serverIp) } ?: TimeSync.measureBestOffset(serverIp)
         if (measured == null) {
-            DebugUtils.logError("❌ No clock reply from $serverIp, not playing out of sync")
+            setStatus("❌ No clock reply from $serverIp, not playing out of sync")
             player.release()
             return
         }
@@ -139,13 +239,18 @@ object AudioSyncManager {
         val localStart = targetTime - offset
         val lateBy = System.currentTimeMillis() - localStart
         if (lateBy > MAX_LATE_MS) {
-            DebugUtils.logWarning("⚠️ Missed start for '$localName' by $lateBy ms, skipping")
+            setStatus("⚠️ Play command for '$localName' arrived $lateBy ms too late, skipped")
             player.release()
             return
         }
 
-        DebugUtils.log("⏱️ Scheduling '$localName' at server time $targetTime (offset=$offset ms, rtt=$rtt ms)")
+        setStatus("▶️ Playing '$localName' in sync (clock offset $offset ms, rtt $rtt ms)")
         player.playAtTimestamp(targetTime, offset)
+    }
+
+    private fun polledFrom(serverIp: String): Boolean {
+        val status = ConnectionManager.connectionStatus.value
+        return status.isConnected && status.serverIp == serverIp
     }
 
     /** Called on the phone the user presses play on. */
@@ -157,6 +262,8 @@ object AudioSyncManager {
             val targetTime = System.currentTimeMillis() + delayMs
 
             lastTargetSeen = targetTime // don't play our own broadcast a second time
+            currentPlayTarget = targetTime
+            currentPlay = "$trackName|$targetTime"
             val message = "PLAY|$trackName|$targetTime".toByteArray()
             sendBroadcast(message)
             DebugUtils.logNetwork("📤 Play command broadcast for '$trackName' at $targetTime")

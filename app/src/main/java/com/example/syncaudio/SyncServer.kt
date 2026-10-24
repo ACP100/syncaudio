@@ -44,10 +44,15 @@ object SyncServer {
 
                 while (isRunning && serverSocket != null) {
                     val packet = DatagramPacket(buffer, buffer.size)
-                    DebugUtils.logNetwork("⏳ Waiting for client message...")
 
                     try {
                         serverSocket?.receive(packet)
+                        // Clients poll several times a second, so answer quietly
+                        if (packet.length == 4 && String(packet.data, 0, 4) == "POLL") {
+                            val reply = AudioSyncManager.pollReply().toByteArray()
+                            serverSocket?.send(DatagramPacket(reply, reply.size, packet.address, packet.port))
+                            continue
+                        }
                         packetCount++
 
                         val clientAddress = packet.address.hostAddress ?: "Unknown"

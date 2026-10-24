@@ -100,6 +100,10 @@ fun AudioPlayerSection(
             ) {
                 Text("Play Synchronized", fontSize = 15.sp)
             }
+
+            // What the sync engine is doing; on the second phone this says why it didn't play
+            val syncStatus by AudioSyncManager.status.collectAsState()
+            Text(syncStatus, fontSize = 13.sp)
         }
     }
 }
