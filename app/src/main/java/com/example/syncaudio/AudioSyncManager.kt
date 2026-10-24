@@ -67,6 +67,9 @@ object AudioSyncManager {
     @Volatile private var lastDownloadAttempt = 0L
     @Volatile private var lastRemoteStopSeq = -1
 
+    /** Manual fine-tune for this phone, e.g. for a Bluetooth speaker: positive plays later. */
+    @Volatile var adjustMs = 0L
+
     // Players that are playing or waiting to start, so Stop can reach them
     private val activePlayers = ConcurrentHashMap.newKeySet<AudioSyncPlayer>()
 
@@ -386,7 +389,12 @@ object AudioSyncManager {
         setStatus("▶️ Playing '$localName' in sync with the host")
         DebugUtils.log("⏱️ clock offset $offset ms, rtt $rtt ms")
         activePlayers.add(player)
-        player.playAtTimestamp(targetTime, offset)
+        player.playAtTimestamp(
+            targetTime,
+            offset,
+            currentOffset = { bestPollSample()?.takeIf { polledFrom(serverIp) }?.first ?: offset },
+            extraDelayMs = { adjustMs }
+        )
     }
 
     private fun polledFrom(serverIp: String): Boolean {
@@ -416,7 +424,7 @@ object AudioSyncManager {
                     if (player.loadAudio(fileUri)) {
                         activePlayers.add(player)
                         setStatus("▶️ Playing '$trackName' for ${joinedPhoneCount() + 1} phones")
-                        player.playAtTimestamp(targetTime, 0L)
+                        player.playAtTimestamp(targetTime, 0L, extraDelayMs = { adjustMs })
                     } else {
                         DebugUtils.logError("❌ Could not open '$trackName' for local playback")
                     }

@@ -103,6 +103,8 @@ fun SimpleSyncScreen(onOpenAdvanced: () -> Unit) {
                     modifier = Modifier.fillMaxWidth()
                 ) { Text("⏹ Stop for everyone") }
 
+                FineTune()
+
                 Text(
                     "Joined phones download the song automatically. Wait until they say Ready, then press play.",
                     fontSize = 13.sp,
@@ -120,6 +122,8 @@ fun SimpleSyncScreen(onOpenAdvanced: () -> Unit) {
                     onClick = { AudioSyncManager.stopHere() },
                     modifier = Modifier.fillMaxWidth()
                 ) { Text("⏹ Stop on this phone") }
+
+                FineTune()
 
                 Text("Not finding the host? Type the address shown on the host's screen:", fontSize = 13.sp, textAlign = TextAlign.Center)
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -147,5 +151,21 @@ fun SimpleSyncScreen(onOpenAdvanced: () -> Unit) {
 
         Spacer(Modifier.height(8.dp))
         TextButton(onClick = onOpenAdvanced) { Text("Advanced testing tools", fontSize = 13.sp) }
+    }
+}
+
+/** Per-phone nudge for what automatic sync can't see, such as a Bluetooth speaker's delay. */
+@Composable
+private fun FineTune() {
+    var adjust by remember { mutableStateOf(AudioSyncManager.adjustMs) }
+    fun set(value: Long) {
+        adjust = value
+        AudioSyncManager.adjustMs = value
+    }
+    Text("Still hear an echo? Fine-tune this phone:", fontSize = 13.sp, textAlign = TextAlign.Center)
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedButton(onClick = { set(adjust - 20) }) { Text("◀ Earlier") }
+        Text("${if (adjust > 0) "+" else ""}$adjust ms", modifier = Modifier.widthIn(min = 64.dp), textAlign = TextAlign.Center)
+        OutlinedButton(onClick = { set(adjust + 20) }) { Text("Later ▶") }
     }
 }
