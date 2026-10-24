@@ -48,8 +48,9 @@ object SyncServer {
                     try {
                         serverSocket?.receive(packet)
                         // Clients poll several times a second, so answer quietly
-                        if (packet.length == 4 && String(packet.data, 0, 4) == "POLL") {
-                            val reply = AudioSyncManager.pollReply(packet.address.hostAddress ?: "").toByteArray()
+                        if (packet.length >= 4 && String(packet.data, 0, 4) == "POLL") {
+                            val request = String(packet.data, 0, packet.length)
+                            val reply = AudioSyncManager.pollReply(packet.address.hostAddress ?: "", request).toByteArray()
                             serverSocket?.send(DatagramPacket(reply, reply.size, packet.address, packet.port))
                             continue
                         }

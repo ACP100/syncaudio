@@ -107,7 +107,8 @@ object TimeSync {
                         DebugUtils.log("📝 Request content: '$request' (${request.length} chars)")
 
                         val t1 = System.currentTimeMillis()
-                        val response = "$t1,$t1".toByteArray()
+                        // Echo the request so a client can match the reply to the request it sent
+                        val response = "$t1,$t1,$request".toByteArray()
                         val reply = DatagramPacket(response, response.size, packet.address, packet.port)
 
                         DebugUtils.log("⏱️  Server timestamp (t1/t2): $t1 ms")
@@ -188,21 +189,26 @@ object TimeSync {
         val socket = DatagramSocket()
         socket.soTimeout = 1000
         val addr = InetAddress.getByName(serverIp)
-        val request = "SYNC".toByteArray()
         val response = ByteArray(64)
 
         var best: Pair<Long, Long>? = null
         try {
-            repeat(samples) {
+            repeat(samples) { i ->
                 try {
+                    val tag = "SYNC|$i"
+                    val request = tag.toByteArray()
                     val t0 = System.currentTimeMillis()
                     socket.send(DatagramPacket(request, request.size, addr, PORT))
-                    val packet = DatagramPacket(response, response.size)
-                    socket.receive(packet)
-                    val t3 = System.currentTimeMillis()
 
-                    val parts = String(packet.data, 0, packet.length).trim().split(",")
-                    if (parts.size < 2) return@repeat
+                    // Skip late replies to earlier samples; they would pair this send time with an old server time
+                    var parts: List<String>
+                    var t3: Long
+                    do {
+                        val packet = DatagramPacket(response, response.size)
+                        socket.receive(packet)
+                        t3 = System.currentTimeMillis()
+                        parts = String(packet.data, 0, packet.length).trim().split(",")
+                    } while (parts.getOrNull(2) != tag)
                     val t1 = parts[0].toLong()
                     val t2 = parts[1].toLong()
 

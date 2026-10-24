@@ -33,7 +33,9 @@ class AudioSyncPlayer(private val context: Context) {
 
     companion object {
         private const val TAG = "AudioSync"
-        private const val LEAD_IN_MS = 600L          // start the output this early, on silence, to measure its delay
+        private const val LEAD_IN_MS = 1200L         // start the output this early, on silence, to measure its delay
+        private const val MIN_LEAD_IN_MS = 300L      // the first speaker timings after play() are often off
+        private const val STEADY_SPAN_MS = 150L      // timings must advance at the sample rate over this long
         private const val CHECK_EVERY_MS = 150L
         private const val CHECKS_PER_DECISION = 7    // act on the median of ~1 s of checks, not on single noisy ones
         private const val DEAD_ZONE_MS = 4.0         // closer than this: leave it alone
@@ -178,24 +180,46 @@ class AudioSyncPlayer(private val context: Context) {
             val playStartedAt = System.currentTimeMillis()
             audioTrack.play()
 
-            // Play silence until the output reports when its frames reach the speaker
+            // Play silence until the output reports steady timing for when its frames reach the speaker.
+            // The first reports after play() can be tens of ms off, so wait until two reports
+            // STEADY_SPAN_MS apart advance at the sample rate.
             val ts = AudioTimestamp()
+            val probe = AudioTimestamp()
             val giveUpAt = System.currentTimeMillis() + TIMESTAMP_WAIT_MS
             var haveTimestamp = false
+            var steady = false
+            var baseFrame = -1L
+            var baseNs = 0L
             while (!stopped && System.currentTimeMillis() < giveUpAt) {
                 writer.writeLeadIn((sampleRate / 100).toLong()) // 10 ms
-                if (audioTrack.getTimestamp(ts) && ts.framePosition > 0) {
-                    haveTimestamp = true
+                if (!audioTrack.getTimestamp(probe) || probe.framePosition <= 0) continue
+                ts.framePosition = probe.framePosition
+                ts.nanoTime = probe.nanoTime
+                haveTimestamp = true
+                if (baseFrame < 0) {
+                    baseFrame = probe.framePosition
+                    baseNs = probe.nanoTime
+                    continue
+                }
+                val spanNs = probe.nanoTime - baseNs
+                if (spanNs < STEADY_SPAN_MS * 1_000_000) continue
+                val rate = (probe.framePosition - baseFrame) * 1e9 / spanNs
+                if (abs(rate - sampleRate) < sampleRate * 0.01 &&
+                    System.currentTimeMillis() - playStartedAt >= MIN_LEAD_IN_MS
+                ) {
+                    steady = true
                     break
                 }
+                baseFrame = probe.framePosition // not steady yet; measure again from here
+                baseNs = probe.nanoTime
             }
             if (stopped) return
             if (haveTimestamp) {
                 val latencyMs = (writer.written - ts.framePosition) * 1000 / sampleRate -
                     (System.nanoTime() - ts.nanoTime) / 1_000_000
                 SyncLog.add(
-                    "Player: speaker timing after ${System.currentTimeMillis() - playStartedAt} ms, " +
-                        "output delay ≈ $latencyMs ms"
+                    "Player: speaker timing ${if (steady) "steady" else "NOT steady"} after " +
+                        "${System.currentTimeMillis() - playStartedAt} ms, output delay ≈ $latencyMs ms"
                 )
             } else {
                 SyncLog.add("Player: WARNING this phone doesn't report speaker timing; sync will be rough")

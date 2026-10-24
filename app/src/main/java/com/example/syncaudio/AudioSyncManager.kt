@@ -88,13 +88,17 @@ object AudioSyncManager {
         SyncLog.add("Status: $text")
     }
 
-    /** What SyncServer replies to a POLL: "STATE|<host now>|<song name>|<target or 0>|<stop seq>". */
-    fun pollReply(fromIp: String): String {
+    /**
+     * What SyncServer replies to "POLL|<seq>": "STATE|<seq>|<host now>|<song name>|<target or 0>|<stop seq>".
+     * The seq is echoed so the joiner can tell this reply from a late reply to an earlier poll.
+     */
+    fun pollReply(fromIp: String, request: String): String {
         val now = System.currentTimeMillis()
+        val seq = request.substringAfter("POLL|", "0")
         val lastSeen = joinedPhones.put(fromIp, now)
         if (lastSeen == null || now - lastSeen > 3000) SyncLog.add("Host: phone $fromIp is polling")
         val target = currentPlayTarget.takeIf { it > now } ?: 0L
-        return "STATE|$now|${hostSongName()}|$target|$stopSeq"
+        return "STATE|$seq|$now|${hostSongName()}|$target|$stopSeq"
     }
 
     /** Phones that polled within the last few seconds. */
@@ -301,6 +305,10 @@ object AudioSyncManager {
         var polledIp = ""
         var polls = 0
         var timeouts = 0
+        var stale = 0
+        var seq = 0
+        val buffer = ByteArray(1024)
+        val reply = DatagramPacket(buffer, buffer.size)
         while (isListening) {
             try {
                 val serverIp = ConnectionManager.connectionStatus.value
@@ -319,26 +327,37 @@ object AudioSyncManager {
                     synchronized(pollSamples) { pollSamples.clear() }
                     polls = 0
                     timeouts = 0
+                    stale = 0
                     setStatus("Connected to host $serverIp")
                 }
                 if (socket == null) socket = DatagramSocket().apply { soTimeout = 500 }
 
-                val request = "POLL".toByteArray()
+                seq++
+                val request = "POLL|$seq".toByteArray()
                 val t0 = System.currentTimeMillis()
                 socket.send(DatagramPacket(request, request.size, InetAddress.getByName(serverIp), SYNC_SERVER_PORT))
-                val buffer = ByteArray(1024)
-                val reply = DatagramPacket(buffer, buffer.size)
-                socket.receive(reply)
-                val t3 = System.currentTimeMillis()
 
-                // "STATE|<host now>|<song name>|<target or 0>|<stop seq>"
-                val parts = String(reply.data, 0, reply.length).split("|")
-                if (parts.size == 5 && parts[0] == "STATE") {
-                    parts[1].toLongOrNull()?.let { hostNow -> addPollSample(hostNow - (t0 + t3) / 2, t3 - t0) }
-                    if (++polls % 50 == 0) logClock(t3 - t0, timeouts)
-                    val song = parts[2]
-                    val targetTime = parts[3].toLongOrNull() ?: 0L
-                    val remoteStopSeq = parts[4].toIntOrNull() ?: 0
+                // A reply that arrived after its poll timed out is still queued on the socket. Skip
+                // anything not answering this poll: pairing this send time with an older host time
+                // made the clock look ~100 ms off with a 0 ms round trip.
+                var parts: List<String>
+                var t3: Long
+                do {
+                    reply.length = buffer.size // receive() shrinks the packet to the last reply's size
+                    socket.receive(reply)
+                    t3 = System.currentTimeMillis()
+                    parts = String(reply.data, 0, reply.length).split("|")
+                    val answersThisPoll = parts.getOrNull(1) == seq.toString()
+                    if (!answersThisPoll) stale++
+                } while (!answersThisPoll)
+
+                // "STATE|<seq>|<host now>|<song name>|<target or 0>|<stop seq>"
+                if (parts.size == 6 && parts[0] == "STATE") {
+                    parts[2].toLongOrNull()?.let { hostNow -> addPollSample(hostNow - (t0 + t3) / 2, t3 - t0) }
+                    if (++polls % 50 == 0) logClock(t3 - t0, timeouts, stale)
+                    val song = parts[3]
+                    val targetTime = parts[4].toLongOrNull() ?: 0L
+                    val remoteStopSeq = parts[5].toIntOrNull() ?: 0
 
                     if (remoteStopSeq != lastRemoteStopSeq) {
                         if (lastRemoteStopSeq != -1) {
@@ -373,7 +392,7 @@ object AudioSyncManager {
     }
 
     /** Every ~5 s while connected: how good the clock estimate is. */
-    private fun logClock(lastRoundTrip: Long, timeouts: Int) {
+    private fun logClock(lastRoundTrip: Long, timeouts: Int, stale: Int) {
         val samples = synchronized(pollSamples) { pollSamples.toList() }
         val estimate = bestPollSample() ?: return
         val rtts = samples.map { it.second }
@@ -381,7 +400,7 @@ object AudioSyncManager {
         SyncLog.add(
             "Clock: offset ${estimate.first} ms (fastest offsets ${offsets.joinToString()}), " +
                 "rtt min ${rtts.minOrNull()} / median ${rtts.sorted()[rtts.size / 2]} / last $lastRoundTrip ms, " +
-                "${rtts.size} samples, $timeouts timeouts"
+                "${rtts.size} samples, $timeouts timeouts, $stale late replies skipped"
         )
     }
 
