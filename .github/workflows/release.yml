@@ -1,10 +1,8 @@
 name: Release APK
 
-# Every push builds the APK, then tags the commit v1.0.<run number> and publishes a GitHub release.
+# Run by hand (Actions tab → Release APK → Run workflow): builds the APK, then tags the commit
+# v1.0.<run number> and publishes a GitHub release. Pushes no longer start it.
 on:
-  push:
-    branches:
-      - "**"
   workflow_dispatch:
 
 permissions:
