@@ -125,6 +125,9 @@ object AudioSyncManager {
     const val SIDE_LEFT = "Left"
     const val SIDE_BOTH = "Both"
     const val SIDE_RIGHT = "Right"
+    private const val PREF_SPEAKER_SIDE = "speaker_side"
+
+    private fun prefs() = context?.getSharedPreferences("syncaudio", Context.MODE_PRIVATE)
 
     /** Which channel this phone plays: Left, Right, or Both (the full mix). Set per phone. */
     private val _speakerSide = MutableStateFlow(SIDE_BOTH)
@@ -132,6 +135,7 @@ object AudioSyncManager {
 
     fun setSpeakerSide(side: String) {
         _speakerSide.value = side
+        prefs()?.edit()?.putString(PREF_SPEAKER_SIDE, side)?.apply() // kept across app restarts
         SyncLog.add("Speaker side: $side")
     }
 
@@ -580,6 +584,7 @@ object AudioSyncManager {
 
     fun setContext(ctx: Context) {
         context = ctx.applicationContext
+        _speakerSide.value = prefs()?.getString(PREF_SPEAKER_SIDE, SIDE_BOTH) ?: SIDE_BOTH
     }
 
     fun startListening() {
