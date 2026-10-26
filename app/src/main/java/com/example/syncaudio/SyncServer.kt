@@ -54,6 +54,14 @@ object SyncServer {
                             serverSocket?.send(DatagramPacket(reply, reply.size, packet.address, packet.port))
                             continue
                         }
+                        // Joining phones looking for hosts: answer with this phone's name
+                        if (packet.length == 8 && String(packet.data, 0, 8) == "DISCOVER") {
+                            if (AudioSyncManager.isHosting) {
+                                val reply = "HOST|${AudioSyncManager.deviceName()}|${AudioSyncManager.joinedPhoneCount()}".toByteArray()
+                                serverSocket?.send(DatagramPacket(reply, reply.size, packet.address, packet.port))
+                            }
+                            continue
+                        }
                         packetCount++
 
                         val clientAddress = packet.address.hostAddress ?: "Unknown"

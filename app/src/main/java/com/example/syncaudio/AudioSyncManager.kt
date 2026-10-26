@@ -2,6 +2,7 @@
 package com.example.syncaudio
 
 import android.content.Context
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -80,6 +81,27 @@ object AudioSyncManager {
     // Clock samples from POLL replies: (offset, round trip). The lowest round trip is the most accurate.
     private val pollSamples = ArrayDeque<Pair<Long, Long>>()
 
+    /** What this phone is playing; startsAtLocalMs is when its first frame is heard, on this phone's clock. */
+    data class NowPlaying(val title: String, val artist: String, val startsAtLocalMs: Long, val durationMs: Long)
+
+    private val _nowPlaying = MutableStateFlow<NowPlaying?>(null)
+    val nowPlaying: StateFlow<NowPlaying?> = _nowPlaying.asStateFlow()
+
+    /** Last measured gap to the host while playing on a joined phone, in ms (null: not measured yet). */
+    private val _driftMs = MutableStateFlow<Long?>(null)
+    val driftMs: StateFlow<Long?> = _driftMs.asStateFlow()
+
+    /** A phone hosting on this Wi-Fi, found by [startDiscovery]. */
+    data class FoundHost(val ip: String, val name: String, val listeners: Int)
+
+    private val _hosts = MutableStateFlow<List<FoundHost>>(emptyList())
+    val hosts: StateFlow<List<FoundHost>> = _hosts.asStateFlow()
+    @Volatile private var discovering = false
+
+    /** Name of the host this phone joined, for display. */
+    @Volatile var hostName = ""
+        private set
+
     private val _status = MutableStateFlow("Idle")
     val status: StateFlow<String> = _status.asStateFlow()
 
@@ -149,6 +171,7 @@ object AudioSyncManager {
     }
 
     fun stopJoining() {
+        stopDiscovery()
         isJoining = false
         lastRemoteStopSeq = -1
         stopHere()
@@ -197,6 +220,100 @@ object AudioSyncManager {
     fun stopHere() {
         activePlayers.forEach { it.stop() }
         activePlayers.clear()
+        _nowPlaying.value = null
+        _driftMs.value = null
+    }
+
+    fun deviceName(): String =
+        "${Build.MANUFACTURER.replaceFirstChar { it.uppercase() }} ${Build.MODEL}".replace('|', ' ')
+
+    /** Keep asking the Wi-Fi who is hosting, updating [hosts], until [stopDiscovery]. */
+    fun startDiscovery() {
+        if (discovering) return
+        discovering = true
+        _hosts.value = emptyList()
+        Thread { discoverLoop() }.start()
+    }
+
+    fun stopDiscovery() {
+        discovering = false
+    }
+
+    private fun discoverLoop() {
+        val socket = DatagramSocket().apply {
+            broadcast = true
+            soTimeout = 300
+        }
+        val lastSeen = linkedMapOf<String, Pair<FoundHost, Long>>()
+        val buffer = ByteArray(256)
+        try {
+            while (discovering) {
+                val request = "DISCOVER".toByteArray()
+                for (target in broadcastTargets()) {
+                    try {
+                        socket.send(DatagramPacket(request, request.size, InetAddress.getByName(target), SYNC_SERVER_PORT))
+                    } catch (e: Exception) {
+                        // an interface that can't broadcast; the others still can
+                    }
+                }
+                val roundEnds = System.currentTimeMillis() + 1500
+                while (discovering && System.currentTimeMillis() < roundEnds) {
+                    try {
+                        val packet = DatagramPacket(buffer, buffer.size)
+                        socket.receive(packet)
+                        // "HOST|<device name>|<listeners>"
+                        val parts = String(packet.data, 0, packet.length).split("|")
+                        val ip = packet.address.hostAddress
+                        if (parts.size >= 3 && parts[0] == "HOST" && ip != null) {
+                            lastSeen[ip] = FoundHost(ip, parts[1], parts[2].toIntOrNull() ?: 0) to System.currentTimeMillis()
+                        }
+                    } catch (e: java.net.SocketTimeoutException) {
+                        // no reply this moment; keep listening until the round ends
+                    }
+                }
+                // Keep a host through one missed round, so the list doesn't flicker
+                val cutoff = System.currentTimeMillis() - 4000
+                lastSeen.entries.removeAll { it.value.second < cutoff }
+                if (discovering) _hosts.value = lastSeen.values.map { it.first }
+            }
+        } catch (e: Exception) {
+            SyncLog.add("Join: looking for hosts failed: ${e.message}")
+        } finally {
+            socket.close()
+        }
+    }
+
+    /** Join the host at [ip], found by discovery. */
+    fun joinHost(host: FoundHost) {
+        stopDiscovery()
+        isHosting = false
+        hostName = host.name
+        manualHostIp = host.ip
+        lastConnectAttempt = System.currentTimeMillis()
+        isJoining = true
+        holdLowLatencyWifi(true)
+        ConnectionManager.updateConnection(isConnected = true, serverIp = host.ip, serverPort = SYNC_SERVER_PORT, message = "joined")
+        SyncLog.add("Join: joined ${host.name} at ${host.ip}")
+    }
+
+    /** Title, artist and length from the file's tags, falling back to its file name. */
+    private fun songInfo(ctx: Context, uri: Uri, startsAtLocalMs: Long): NowPlaying {
+        var title = ""
+        var artist = ""
+        var duration = 0L
+        val retriever = MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(ctx, uri)
+            title = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE).orEmpty()
+            artist = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST).orEmpty()
+            duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+        } catch (e: Exception) {
+            DebugUtils.logWarning("⚠️ Could not read song tags: ${e.message}")
+        } finally {
+            try { retriever.release() } catch (e: Exception) {}
+        }
+        if (title.isBlank()) title = displayName(ctx, uri).substringBeforeLast('.')
+        return NowPlaying(title, artist, startsAtLocalMs, duration)
     }
 
     private fun downloadSong(hostIp: String, song: String) {
@@ -476,12 +593,17 @@ object AudioSyncManager {
         SyncLog.add("Join: play '$localName' starts in ${-lateBy} ms (clock offset $offset ms, rtt $rtt ms, fine-tune $adjustMs ms)")
         setStatus("▶️ Playing '$localName' in sync with the host")
         activePlayers.add(player)
+        _driftMs.value = null
+        _nowPlaying.value = songInfo(ctx, localFile, localStart)
         player.playAtTimestamp(
             targetTime,
             offset,
             currentOffset = { bestPollSample()?.takeIf { polledFrom(serverIp) }?.first ?: offset },
             extraDelayMs = { adjustMs },
-            onDrift = { aheadMs -> _status.value = "▶️ Playing '$localName' · ${kotlin.math.abs(aheadMs)} ms from the host" }
+            onDrift = { aheadMs ->
+                _driftMs.value = aheadMs
+                _status.value = "▶️ Playing '$localName' · ${kotlin.math.abs(aheadMs)} ms from the host"
+            }
         )
     }
 
@@ -511,6 +633,7 @@ object AudioSyncManager {
                     val player = AudioSyncPlayer(c)
                     if (player.loadAudio(fileUri)) {
                         activePlayers.add(player)
+                        _nowPlaying.value = songInfo(c, fileUri, targetTime)
                         setStatus("▶️ Playing '$trackName' for ${joinedPhoneCount() + 1} phones")
                         player.playAtTimestamp(targetTime, 0L, extraDelayMs = { adjustMs })
                     } else {
@@ -521,7 +644,8 @@ object AudioSyncManager {
         }
     }
 
-    private fun sendBroadcast(message: ByteArray) {
+    /** Broadcast addresses to try. */
+    private fun broadcastTargets(): MutableSet<String> {
         val targets = linkedSetOf("255.255.255.255")
         // Broadcast on every interface: on a phone hosting a hotspot, 255.255.255.255 often
         // leaves through mobile data instead of the hotspot
@@ -537,6 +661,11 @@ object AudioSyncManager {
         } catch (e: Exception) {
             DebugUtils.logWarning("⚠️ Could not list network interfaces: ${e.message}")
         }
+        return targets
+    }
+
+    private fun sendBroadcast(message: ByteArray) {
+        val targets = broadcastTargets()
         targets.addAll(peers)
         ConnectionManager.connectionStatus.value.serverIp.takeIf { it.isNotEmpty() }?.let { targets.add(it) }
         DebugUtils.log("📡 Sending PLAY to: ${targets.joinToString()}")
