@@ -7,11 +7,11 @@ import java.net.ServerSocket
 import java.net.Socket
 
 /**
- * Serves the host's selected song to joining phones, so only the host has to pick it.
+ * Serves a song of the host's to joining phones, so only the host has to pick it: [song] says which
+ * (the current one, or the next one so joined phones can fetch it early).
  * Speaks the same format FileTransferClient reads: name length, name, size, bytes.
  */
-object SongServer {
-    private const val PORT = 5003
+class SongServer(private val port: Int, private val song: () -> android.net.Uri?) {
 
     @Volatile private var running = false
     private var serverSocket: ServerSocket? = null
@@ -23,8 +23,8 @@ object SongServer {
 
         Thread {
             try {
-                serverSocket = ServerSocket(PORT)
-                DebugUtils.logSuccess("✅ Song server listening on port $PORT")
+                serverSocket = ServerSocket(port)
+                DebugUtils.logSuccess("✅ Song server listening on port $port")
                 while (running) {
                     val client = serverSocket?.accept() ?: break
                     Thread { serve(appContext, client) }.start()
@@ -46,7 +46,7 @@ object SongServer {
     private fun serve(context: Context, client: Socket) {
         try {
             client.use {
-                val uri = FileSelectionManager.getSelectedFile() ?: return
+                val uri = song() ?: return
                 val bytes = context.contentResolver.openInputStream(uri)?.use { input -> input.readBytes() } ?: return
                 val name = AudioSyncManager.trackName(context, uri).toByteArray()
 

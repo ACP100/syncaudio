@@ -5,6 +5,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -35,7 +36,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import android.net.Uri
 import com.example.syncaudio.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.abs
@@ -49,6 +53,8 @@ private val Faint = Color(0xFF8A8D98)
 private val Accent = Color(0xFF3DDC97)
 private val AccentDim = Color(0xFF15241D)
 private val Unplayed = Color(0xFF3A3D47)
+private val Raised = Color(0xFF22252D)
+private val Amber = Color(0xFFE8B04A)
 
 private val WAVE = listOf(30, 52, 74, 40, 96, 120, 84, 60, 140, 170, 120, 90, 150, 190, 160, 110, 130, 170, 140, 100, 80, 120, 90, 60, 70, 44, 56, 32)
 
@@ -204,6 +210,7 @@ private fun HostScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
     val playlist by AudioSyncManager.playlist.collectAsState()
     val index by AudioSyncManager.playlistIndex.collectAsState()
     val now = rememberNow()
+    var showQueue by remember { mutableStateOf(false) }
     var joined by remember { mutableStateOf(0) }
     LaunchedEffect(Unit) {
         while (true) {
@@ -237,11 +244,18 @@ private fun HostScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Box(Modifier.size(10.dp).clip(CircleShape).background(if (joined > 0) Accent else Faint))
+            Box(Modifier.size(10.dp).clip(CircleShape).background(
+                when {
+                    paused != null -> Amber
+                    joined > 0 -> Accent
+                    else -> Faint
+                }
+            ))
             Text(
-                when (joined) {
-                    0 -> "No phones joined yet"
-                    1 -> "1 phone joined"
+                when {
+                    paused != null -> "Paused on ${joined + 1} phone${if (joined == 0) "" else "s"}"
+                    joined == 0 -> "No phones joined yet"
+                    joined == 1 -> "1 phone joined"
                     else -> "$joined phones joined"
                 },
                 color = Ink, fontSize = 15.sp, fontWeight = FontWeight.Medium
@@ -249,11 +263,13 @@ private fun HostScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
         }
 
         Box(
-            Modifier.fillMaxWidth().height(240.dp).clip(RoundedCornerShape(24.dp)).background(Panel),
+            Modifier.fillMaxWidth().height(180.dp).clip(RoundedCornerShape(24.dp)).background(Panel),
             contentAlignment = Alignment.Center
         ) {
             val played = (progress * WAVE.size).toInt()
-            Bars(WAVE.map { it * 2 / 3 }, barWidth = 5.dp, gap = 5.dp) { i -> if (i < played) Accent else Unplayed }
+            Bars(WAVE.map { it / 2 }, barWidth = 5.dp, gap = 5.dp) { i ->
+                if (i < played) (if (paused != null) Muted else Accent) else Unplayed
+            }
         }
 
         SongTitle(
@@ -309,14 +325,43 @@ private fun HostScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
             ) { SkipIcon(forward = true, color = if (hasNext) Ink else Line) }
         }
 
-        Text(
-            when {
-                starting -> "Starting on every phone…"
-                playlist.size > 1 -> "Song ${index + 1} of ${playlist.size}"
-                else -> ""
-            },
-            color = Muted, fontSize = 13.sp, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth()
-        )
+        if (starting) {
+            Text(
+                "Starting on every phone…",
+                color = Muted, fontSize = 13.sp, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth()
+            )
+        }
+
+        if (playlist.isNotEmpty()) {
+            val nextUri = playlist.getOrNull(index + 1)
+            val nextTitle by produceState<String?>(null, nextUri) {
+                value = nextUri?.let { uri ->
+                    withContext(Dispatchers.IO) { AudioSyncManager.songDetails(uri) }
+                        ?.let { if (it.artist.isNotEmpty()) "${it.title} · ${it.artist}" else it.title }
+                }
+            }
+            Surface(
+                onClick = { showQueue = true },
+                shape = RoundedCornerShape(16.dp),
+                color = Color.Transparent,
+                border = BorderStroke(1.5.dp, Line),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    SectionLabel("Up next")
+                    Text(
+                        if (nextUri == null) "End of the list" else nextTitle ?: "…",
+                        color = Ink, fontSize = 14.sp, fontWeight = FontWeight.Medium,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f)
+                    )
+                    Text("${index + 1} of ${playlist.size}", color = Muted, fontSize = 13.sp)
+                }
+            }
+        }
 
         Spacer(Modifier.weight(1f))
         SecondaryButton(if (songUri == null) "Pick songs" else "Change songs", height = 52.dp) {
@@ -326,6 +371,84 @@ private fun HostScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
             Text("Stop hosting", color = Faint, fontSize = 14.sp)
         }
     }
+
+    if (showQueue) QueueSheet(onDismiss = { showQueue = false })
+}
+
+/** The host's playlist: tap a song to switch to it, or add more. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun QueueSheet(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val activity = context as MainActivity
+    val scope = rememberCoroutineScope()
+    val playlist by AudioSyncManager.playlist.collectAsState()
+    val index by AudioSyncManager.playlistIndex.collectAsState()
+    val details by produceState(emptyMap<Uri, AudioSyncManager.NowPlaying>(), playlist) {
+        value = withContext(Dispatchers.IO) {
+            playlist.mapNotNull { uri -> AudioSyncManager.songDetails(uri)?.let { uri to it } }.toMap()
+        }
+    }
+    val totalMinutes = details.values.sumOf { it.durationMs } / 60_000
+
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = Panel, contentColor = Ink) {
+        Column(
+            Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 28.dp),
+            verticalArrangement = Arrangement.spacedBy(18.dp)
+        ) {
+            Row(verticalAlignment = Alignment.Bottom) {
+                Text("Up next", color = Ink, fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                Text(
+                    "${playlist.size} song${if (playlist.size == 1) "" else "s"}" + if (totalMinutes > 0) " · $totalMinutes min" else "",
+                    color = Muted, fontSize = 13.sp
+                )
+            }
+            Column(
+                Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                playlist.forEachIndexed { i, uri ->
+                    val song = details[uri]
+                    val current = i == index
+                    Surface(
+                        onClick = { scope.launch { AudioSyncManager.playIndex(i) } },
+                        shape = RoundedCornerShape(14.dp),
+                        color = if (current) Raised else Color.Transparent,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            Modifier.padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(14.dp)
+                        ) {
+                            Box(Modifier.width(28.dp), contentAlignment = Alignment.Center) {
+                                if (current) PlayIcon(Accent, 16.dp)
+                                else Text("${i + 1}", color = Faint, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(
+                                    song?.title ?: "…", color = if (current) Accent else Ink, fontSize = 15.sp,
+                                    fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis
+                                )
+                                if (!song?.artist.isNullOrEmpty()) {
+                                    Text(song!!.artist, color = Muted, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                            }
+                            if ((song?.durationMs ?: 0L) > 0) Text(formatTime(song!!.durationMs), color = Faint, fontSize = 13.sp)
+                        }
+                    }
+                }
+            }
+            Text(
+                "Joined phones fetch the next song while this one plays, so the switch is seamless.",
+                color = Faint, fontSize = 13.sp, lineHeight = 19.sp
+            )
+            SecondaryButton("Add songs", height = 52.dp) {
+                AudioSyncManager.addingSongs = true
+                FilePickerHelper.openAudioPicker(activity)
+            }
+        }
+    }
 }
 
 @Composable
@@ -333,6 +456,7 @@ private fun ListenerScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
     val nowPlaying by AudioSyncManager.nowPlaying.collectAsState()
     val drift by AudioSyncManager.driftMs.collectAsState()
     val status by AudioSyncManager.status.collectAsState()
+    val download by AudioSyncManager.download.collectAsState()
     val now = rememberNow()
     val playing = nowPlaying?.takeIf { isPlaying(it, now) }
 
@@ -353,6 +477,17 @@ private fun ListenerScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(28.dp, Alignment.CenterVertically)
         ) {
+          val dl = download
+          if (playing == null && dl != null) {
+            DownloadRing(dl.percent)
+            Badge("Getting the song from the host", Muted, Panel)
+            SongTitle(title = dl.song.substringBeforeLast('.'), artist = "", centered = true)
+            Text(
+                "This phone joins in, in sync, as soon as the song is here.",
+                color = Faint, fontSize = 14.sp, lineHeight = 21.sp, textAlign = TextAlign.Center,
+                modifier = Modifier.widthIn(max = 280.dp)
+            )
+          } else {
             Box(
                 Modifier.size(220.dp).border(2.dp, if (playing != null) Accent else Line, CircleShape),
                 contentAlignment = Alignment.Center
@@ -380,6 +515,7 @@ private fun ListenerScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
                 positionMs = playing?.let { now - it.startsAtLocalMs } ?: 0L,
                 durationMs = playing?.durationMs ?: 0L
             )
+          }
         }
 
         Text(
@@ -390,11 +526,11 @@ private fun ListenerScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SettingsDialog(onDismiss: () -> Unit, onOpenAdvanced: () -> Unit) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
-    val lines by SyncLog.lines.collectAsState()
     var adjust by remember { mutableStateOf(AudioSyncManager.adjustMs) }
     var copied by remember { mutableStateOf(false) }
     fun set(value: Long) {
@@ -403,42 +539,79 @@ private fun SettingsDialog(onDismiss: () -> Unit, onOpenAdvanced: () -> Unit) {
         SyncLog.add("Fine-tune: $value ms")
     }
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor = Panel,
-        titleContentColor = Ink,
-        textContentColor = Ink,
-        title = { Text("Settings") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                Text("Hear an echo? Nudge this phone earlier or later.", color = Muted, fontSize = 13.sp)
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = { set(adjust - 5) }, border = BorderStroke(1.dp, Line)) { Text("Earlier", color = Ink) }
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = Panel, contentColor = Ink) {
+        Column(
+            Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 28.dp),
+            verticalArrangement = Arrangement.spacedBy(20.dp)
+        ) {
+            Text("Settings", color = Ink, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+
+            Column(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Raised).padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text("Fine-tune this phone", color = Ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "Hear an echo, e.g. with a Bluetooth speaker? Nudge this phone until it lines up.",
+                    color = Muted, fontSize = 13.sp, lineHeight = 19.sp
+                )
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedButton(
+                        onClick = { set(adjust - 5) },
+                        modifier = Modifier.weight(1f).height(48.dp),
+                        shape = RoundedCornerShape(14.dp),
+                        border = BorderStroke(1.5.dp, Unplayed),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Ink)
+                    ) { Text("Earlier", fontWeight = FontWeight.SemiBold) }
                     Text(
                         "${if (adjust > 0) "+" else ""}$adjust ms",
-                        color = Ink, textAlign = TextAlign.Center, modifier = Modifier.widthIn(min = 64.dp)
+                        color = Ink, fontSize = 20.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center,
+                        modifier = Modifier.width(84.dp)
                     )
-                    OutlinedButton(onClick = { set(adjust + 5) }, border = BorderStroke(1.dp, Line)) { Text("Later", color = Ink) }
+                    OutlinedButton(
+                        onClick = { set(adjust + 5) },
+                        modifier = Modifier.weight(1f).height(48.dp),
+                        shape = RoundedCornerShape(14.dp),
+                        border = BorderStroke(1.5.dp, Unplayed),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Ink)
+                    ) { Text("Later", fontWeight = FontWeight.SemiBold) }
                 }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Debug log", color = Ink, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                    TextButton(onClick = {
-                        clipboard.setText(AnnotatedString(SyncLog.report(context)))
-                        copied = true
-                    }) { Text(if (copied) "Copied" else "Copy log", color = Accent) }
-                }
-                Box(Modifier.fillMaxWidth().height(160.dp).verticalScroll(rememberScrollState())) {
-                    Text(
-                        if (lines.isEmpty()) "Nothing yet" else lines.asReversed().joinToString("\n"),
-                        color = Muted, fontFamily = FontFamily.Monospace, fontSize = 10.sp, lineHeight = 13.sp
-                    )
-                }
-                Text("v${SyncLog.appVersion(context)}", color = Faint, fontSize = 12.sp)
             }
-        },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("Done", color = Accent) } },
-        dismissButton = { TextButton(onClick = onOpenAdvanced) { Text("Testing tools", color = Faint) } }
-    )
+
+            Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Raised)) {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            clipboard.setText(AnnotatedString(SyncLog.report(context)))
+                            copied = true
+                        }
+                        .padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text("Report a problem", color = Ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                        Text("Copies the sync log to paste in a message", color = Muted, fontSize = 13.sp)
+                    }
+                    Text(if (copied) "Copied" else "Copy log", color = Accent, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                }
+                Box(Modifier.padding(horizontal = 16.dp).fillMaxWidth().height(1.dp).background(Line))
+                Row(
+                    Modifier.fillMaxWidth().clickable(onClick = onOpenAdvanced).padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Testing tools", color = Ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                    Text("›", color = Muted, fontSize = 22.sp)
+                }
+            }
+
+            Text(
+                "SyncAudio v${SyncLog.appVersion(context)}",
+                color = Faint, fontSize = 12.sp, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth()
+            )
+            PrimaryButton("Done", onClick = onDismiss)
+        }
+    }
 }
 
 // ---- pieces ----
@@ -500,6 +673,13 @@ private fun ProgressBar(positionMs: Long, durationMs: Long, onSeek: ((Long) -> U
         ) {
             Box(Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)).background(Line)) {
                 Box(Modifier.fillMaxWidth(fraction).height(4.dp).clip(RoundedCornerShape(2.dp)).background(Ink))
+            }
+            if (onSeek != null && durationMs > 0) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Spacer(Modifier.weight(fraction.coerceAtLeast(0.0001f)))
+                    Box(Modifier.size(14.dp).clip(CircleShape).background(Ink))
+                    Spacer(Modifier.weight((1f - fraction).coerceAtLeast(0.0001f)))
+                }
             }
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -595,9 +775,31 @@ private fun SettingsIcon() {
     }
 }
 
+/** Ring that fills as the song arrives, with the percentage inside. */
 @Composable
-private fun PlayIcon(color: Color) {
-    Canvas(Modifier.size(30.dp)) {
+private fun DownloadRing(percent: Int) {
+    Box(Modifier.size(220.dp), contentAlignment = Alignment.Center) {
+        Canvas(Modifier.fillMaxSize()) {
+            val stroke = 8.dp.toPx()
+            val inset = stroke / 2
+            val arcSize = Size(size.width - stroke, size.height - stroke)
+            drawArc(Line, 0f, 360f, false, Offset(inset, inset), arcSize, style = Stroke(stroke))
+            drawArc(Accent, -90f, 360f * percent / 100f, false, Offset(inset, inset), arcSize, style = Stroke(stroke, cap = StrokeCap.Round))
+        }
+        Column(
+            Modifier.size(168.dp).clip(CircleShape).background(Panel),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text("$percent%", color = Ink, fontSize = 44.sp, fontWeight = FontWeight.Bold)
+            Text("received", color = Muted, fontSize = 13.sp)
+        }
+    }
+}
+
+@Composable
+private fun PlayIcon(color: Color, iconSize: Dp = 30.dp) {
+    Canvas(Modifier.size(iconSize)) {
         val path = Path().apply {
             moveTo(size.width * 0.32f, size.height * 0.2f)
             lineTo(size.width * 0.82f, size.height * 0.5f)

@@ -64,9 +64,24 @@ object AudioSyncManager {
         private set
     @Volatile private var manualHostIp: String? = null
     @Volatile private var lastConnectAttempt = 0L
-    @Volatile private var downloadedSong: Uri? = null
-    @Volatile private var downloadedName = ""
+    // Songs this phone has from the host, by name: the current one and, fetched early, the next
+    private val songCache = ConcurrentHashMap<String, Uri>()
     @Volatile private var downloading = false
+    @Volatile private var lastNextQuery = 0L
+
+    private const val SONG_PORT = 5003
+    private const val NEXT_SONG_PORT = 5006
+    private val songServer = SongServer(SONG_PORT) { FileSelectionManager.getSelectedFile() }
+    private val nextSongServer = SongServer(NEXT_SONG_PORT) { nextSongUri() }
+
+    /** A song being fetched from the host for playing now (not an early fetch of the next one). */
+    data class Download(val song: String, val percent: Int)
+
+    private val _download = MutableStateFlow<Download?>(null)
+    val download: StateFlow<Download?> = _download.asStateFlow()
+
+    /** Set before opening the picker from the playlist sheet: the picked songs are added, not swapped in. */
+    @Volatile var addingSongs = false
     @Volatile private var lastDownloadAttempt = 0L
     @Volatile private var lastRemoteStopSeq = -1
 
@@ -156,7 +171,8 @@ object AudioSyncManager {
         isJoining = false
         isHosting = true
         SyncServer.start()
-        SongServer.start(ctx)
+        songServer.start(ctx)
+        nextSongServer.start(ctx)
         Thread { advanceWhenSongEnds() }.start()
         holdLowLatencyWifi(true)
         SyncLog.add("Host: started, address ${NetworkUtils.getLocalIpAddress(ctx)}")
@@ -167,7 +183,8 @@ object AudioSyncManager {
         stopEveryone()
         isHosting = false
         SyncServer.stop()
-        SongServer.stop()
+        songServer.stop()
+        nextSongServer.stop()
         holdLowLatencyWifi(false)
         setStatus("Idle")
     }
@@ -252,6 +269,27 @@ object AudioSyncManager {
         SyncLog.add("Host: paused at ${position / 1000} s")
     }
 
+    /** Host: songs came back from the picker. */
+    fun onSongsPicked(uris: List<Uri>) {
+        if (addingSongs && _playlist.value.isNotEmpty()) {
+            _playlist.value = _playlist.value + uris
+        } else {
+            setPlaylist(uris)
+        }
+        addingSongs = false
+    }
+
+    /** Title, artist and length of [uri], for lists. */
+    fun songDetails(uri: Uri): NowPlaying? = context?.let { songInfo(it, uri, 0L) }
+
+    /** Name of the song after the current one, for joined phones to fetch early ("" if none). */
+    fun nextSongName(): String {
+        val ctx = context ?: return ""
+        return nextSongUri()?.let { trackName(ctx, it) } ?: ""
+    }
+
+    private fun nextSongUri(): Uri? = _playlist.value.getOrNull(_playlistIndex.value + 1)
+
     /** Host: replace the playlist with [uris] and select the first. */
     fun setPlaylist(uris: List<Uri>) {
         if (uris.isEmpty()) return
@@ -266,9 +304,11 @@ object AudioSyncManager {
     }
 
     /** Host: go [delta] songs along the playlist; keeps playing if it was playing. */
-    suspend fun skip(delta: Int) {
+    suspend fun skip(delta: Int) = playIndex(_playlistIndex.value + delta)
+
+    /** Host: switch to song [index]; keeps playing if it was playing. */
+    suspend fun playIndex(index: Int) {
         val list = _playlist.value
-        val index = _playlistIndex.value + delta
         if (index !in list.indices) return
         val wasPlaying = _nowPlaying.value != null
         stopEveryone()
@@ -386,35 +426,66 @@ object AudioSyncManager {
         return NowPlaying(title, artist, startsAtLocalMs, duration)
     }
 
-    private fun downloadSong(hostIp: String, song: String) {
+    /** Fetch [song] from the host; [early] = the next song, fetched quietly while this one plays. */
+    private fun downloadSong(hostIp: String, song: String, early: Boolean = false) {
         val ctx = context ?: return
         downloading = true
         lastDownloadAttempt = System.currentTimeMillis()
-        setStatus("⬇️ Getting '$song' from the host…")
+        if (!early) {
+            _download.value = Download(song, 0)
+            setStatus("⬇️ Getting '$song' from the host…")
+        }
         var lastPercent = -1
         try {
             kotlinx.coroutines.runBlocking {
                 FileTransferClient(
+                    port = if (early) NEXT_SONG_PORT else SONG_PORT,
                     onProgress = { percent ->
-                        if (percent != lastPercent) {
+                        if (!early && percent != lastPercent) {
                             lastPercent = percent
+                            _download.value = Download(song, percent)
                             _status.value = "⬇️ Getting '$song' from the host… $percent%"
                         }
                     },
                     onCompleted = { file ->
-                        SyncLog.add("Join: got '$song', ${file.length() / 1024} KB in ${System.currentTimeMillis() - lastDownloadAttempt} ms")
-                        downloadedSong = Uri.fromFile(file)
-                        downloadedName = song
+                        SyncLog.add("Join: got ${if (early) "next song " else ""}'$song', ${file.length() / 1024} KB in ${System.currentTimeMillis() - lastDownloadAttempt} ms")
+                        songCache[song] = Uri.fromFile(file)
                     }
                 ).downloadFile(ctx, hostIp)
             }
         } finally {
             downloading = false
+            if (!early) _download.value = null
         }
-        setStatus(
-            if (downloadedName == song) "✅ Ready: '$song'. Waiting for the host to press play."
-            else "❌ Couldn't get '$song' from the host, retrying…"
-        )
+        if (!early) {
+            setStatus(
+                if (songCache.containsKey(song)) "✅ Ready: '$song'. Waiting for the host to press play."
+                else "❌ Couldn't get '$song' from the host, retrying…"
+            )
+        }
+    }
+
+    /** Ask the host which song comes next, then fetch it early if this phone doesn't have it. */
+    private fun fetchNextSong(hostIp: String) {
+        try {
+            val next = DatagramSocket().use { socket ->
+                socket.soTimeout = 500
+                val request = "NEXT".toByteArray()
+                socket.send(DatagramPacket(request, request.size, InetAddress.getByName(hostIp), SYNC_SERVER_PORT))
+                val buffer = ByteArray(512)
+                val reply = DatagramPacket(buffer, buffer.size)
+                socket.receive(reply)
+                // "NEXT|<song name>" ("" when the current song is the last)
+                String(reply.data, 0, reply.length).substringAfter("NEXT|", "")
+            }
+            if (next.isNotEmpty() && !songCache.containsKey(next)) {
+                downloadSong(hostIp, next, early = true)
+            }
+        } catch (e: Exception) {
+            // older host without NEXT, or no reply: the next song is fetched when it starts instead
+        } finally {
+            downloading = false
+        }
     }
 
     fun addPeer(ip: String) {
@@ -553,14 +624,18 @@ object AudioSyncManager {
                         }
                         lastRemoteStopSeq = remoteStopSeq
                     }
-                    if (song.isNotEmpty() && song != downloadedName && !downloading &&
-                        System.currentTimeMillis() - lastDownloadAttempt > 3000
-                    ) {
+                    val haveSong = songCache.containsKey(song)
+                    val nowMs = System.currentTimeMillis()
+                    if (song.isNotEmpty() && !haveSong && !downloading && nowMs - lastDownloadAttempt > 3000) {
                         downloading = true
                         Thread { downloadSong(serverIp, song) }.start()
+                    } else if (haveSong && !downloading && nowMs - lastNextQuery > 3000) {
+                        lastNextQuery = nowMs
+                        downloading = true
+                        Thread { fetchNextSong(serverIp) }.start()
                     }
                     // Only once the song is here: a play that arrives mid-download is joined late, in sync
-                    if (targetTime > 0 && targetTime != lastTargetSeen && !downloading && song == downloadedName) {
+                    if (targetTime > 0 && targetTime != lastTargetSeen && haveSong) {
                         lastTargetSeen = targetTime
                         Thread { handlePlay(song, targetTime, serverIp) }.start()
                     }
@@ -623,11 +698,7 @@ object AudioSyncManager {
     /** Runs on a listening phone when a PLAY command arrives. */
     private fun handlePlay(trackName: String, targetTime: Long, serverIp: String) {
         val ctx = context ?: return
-        if (downloading) {
-            setStatus("⏳ Still getting '$trackName' from the host. Ask the host to press play again.")
-            return
-        }
-        val localFile = downloadedSong?.takeIf { downloadedName == trackName } ?: FileSelectionManager.getSelectedFile()
+        val localFile = songCache[trackName] ?: FileSelectionManager.getSelectedFile()
         if (localFile == null) {
             setStatus("⚠️ The host played '$trackName' but this phone doesn't have it yet")
             return

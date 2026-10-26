@@ -172,8 +172,8 @@ class MainActivity : ComponentActivity() {
             data = data,
             onFilePicked = { uris ->
                 DebugUtils.log("✅ ${uris.size} file(s) selected")
-                // The picked songs become the host's playlist; the first is selected
-                AudioSyncManager.setPlaylist(uris)
+                // The picked songs become (or are added to) the host's playlist
+                AudioSyncManager.onSongsPicked(uris)
             }
         )
     }
