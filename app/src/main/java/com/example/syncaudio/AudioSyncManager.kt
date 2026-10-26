@@ -122,6 +122,19 @@ object AudioSyncManager {
     private val _party = MutableStateFlow<Party?>(null)
     val party: StateFlow<Party?> = _party.asStateFlow()
 
+    const val SIDE_LEFT = "Left"
+    const val SIDE_BOTH = "Both"
+    const val SIDE_RIGHT = "Right"
+
+    /** Which channel this phone plays: Left, Right, or Both (the full mix). Set per phone. */
+    private val _speakerSide = MutableStateFlow(SIDE_BOTH)
+    val speakerSide: StateFlow<String> = _speakerSide.asStateFlow()
+
+    fun setSpeakerSide(side: String) {
+        _speakerSide.value = side
+        SyncLog.add("Speaker side: $side")
+    }
+
     /** A phone hosting on this Wi-Fi, found by [startDiscovery]. */
     data class FoundHost(val ip: String, val name: String, val listeners: Int)
 

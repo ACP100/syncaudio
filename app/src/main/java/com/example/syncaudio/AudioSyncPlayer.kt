@@ -405,6 +405,7 @@ class AudioSyncPlayer(private val context: Context) {
         fun writeSong(pcm: ByteArray) {
             val frames = pcm.size / frameSize
             recordLevel(pcm, nextSongFrame, frames)
+            applySpeakerSide(pcm, frames)
             var pos = 0
             if ((pendingInsert > 0 || pendingDrop > 0) && !dropping) {
                 val fade = min(fadeFrames, frames)
@@ -459,6 +460,22 @@ class AudioSyncPlayer(private val context: Context) {
             write(pcm, startFrame * frameSize, count * frameSize)
             nextSongFrame += count
             written += count
+        }
+
+        /**
+         * Stereo mode: a Left phone plays the left channel on both of its outputs, a Right phone the
+         * right one. Read per buffer, so a change is heard after what's already queued (a fraction of a second).
+         */
+        private fun applySpeakerSide(pcm: ByteArray, frames: Int) {
+            val side = AudioSyncManager.speakerSide.value
+            if (channels != 2 || side == AudioSyncManager.SIDE_BOTH || (bytesPerSample != 2 && !isFloat)) return
+            val buffer = ByteBuffer.wrap(pcm).order(ByteOrder.nativeOrder())
+            val from = if (side == AudioSyncManager.SIDE_LEFT) 0 else 1
+            for (f in 0 until frames) {
+                val src = (f * 2 + from) * bytesPerSample
+                val dst = (f * 2 + 1 - from) * bytesPerSample
+                if (isFloat) buffer.putFloat(dst, buffer.getFloat(src)) else buffer.putShort(dst, buffer.getShort(src))
+            }
         }
 
         /** Note this buffer's loudness (RMS of every 4th sample) in [levels] for the song time it covers. */

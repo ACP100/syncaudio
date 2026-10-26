@@ -222,6 +222,7 @@ private fun HostScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
     val now = rememberNow()
     var showQueue by remember { mutableStateOf(false) }
     var showPartySheet by remember { mutableStateOf(false) }
+    val side by AudioSyncManager.speakerSide.collectAsState()
     var joined by remember { mutableStateOf(0) }
     LaunchedEffect(Unit) {
         while (true) {
@@ -270,7 +271,7 @@ private fun HostScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
                     joined == 0 -> "No phones joined yet"
                     joined == 1 -> "1 phone joined"
                     else -> "$joined phones joined"
-                },
+                } + if (side != AudioSyncManager.SIDE_BOTH) " · $side speaker" else "",
                 color = Ink, fontSize = 15.sp, fontWeight = FontWeight.Medium
             )
         }
@@ -471,6 +472,7 @@ private fun ListenerScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
     val drift by AudioSyncManager.driftMs.collectAsState()
     val status by AudioSyncManager.status.collectAsState()
     val download by AudioSyncManager.download.collectAsState()
+    val side by AudioSyncManager.speakerSide.collectAsState()
     val now = rememberNow()
     val playing = nowPlaying?.takeIf { isPlaying(it, now) }
 
@@ -507,15 +509,29 @@ private fun ListenerScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
                 contentAlignment = Alignment.Center
             ) {
                 Box(Modifier.size(168.dp).clip(CircleShape).background(Panel), contentAlignment = Alignment.Center) {
-                    Bars(listOf(24, 44, 68, 52, 84, 60, 40, 56, 28), barWidth = 6.dp, gap = 5.dp) {
-                        if (playing != null) Accent else Unplayed
+                    if (side != AudioSyncManager.SIDE_BOTH) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(side.take(1), color = Accent, fontSize = 64.sp, fontWeight = FontWeight.Bold, lineHeight = 64.sp)
+                            Text("$side speaker", color = Muted, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    } else {
+                        Bars(listOf(24, 44, 68, 52, 84, 60, 40, 56, 28), barWidth = 6.dp, gap = 5.dp) {
+                            if (playing != null) Accent else Unplayed
+                        }
                     }
                 }
             }
 
             if (playing != null) {
                 val d = drift
-                Badge(if (d == null) "Getting in sync…" else "In sync · ±${abs(d)} ms", Accent, AccentDim)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Badge(if (d == null) "Getting in sync…" else "In sync · ±${abs(d)} ms", Accent, AccentDim)
+                    if (side != AudioSyncManager.SIDE_BOTH) {
+                        OutlinedButton(onClick = onSettings, border = BorderStroke(1.5.dp, Line), shape = RoundedCornerShape(20.dp)) {
+                            Text("Change side", color = Ink, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
             } else {
                 Badge(status.ifEmpty { "Waiting for the host" }, Muted, Panel)
             }
@@ -533,7 +549,8 @@ private fun ListenerScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
         }
 
         Text(
-            "The host controls playback. Keep this screen open.",
+            if (side == AudioSyncManager.SIDE_BOTH) "The host controls playback. Keep this screen open."
+            else "Put this phone on the ${side.lowercase()}, facing the room.",
             color = Faint, fontSize = 13.sp, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth()
         )
         SecondaryButton("Leave room", height = 52.dp, onClick = onLeave)
@@ -553,12 +570,60 @@ private fun SettingsDialog(onDismiss: () -> Unit, onOpenAdvanced: () -> Unit) {
         SyncLog.add("Fine-tune: $value ms")
     }
 
+    val side by AudioSyncManager.speakerSide.collectAsState()
+
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = Panel, contentColor = Ink) {
         Column(
-            Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 28.dp),
+            Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(start = 20.dp, end = 20.dp, bottom = 28.dp),
             verticalArrangement = Arrangement.spacedBy(20.dp)
         ) {
             Text("Settings", color = Ink, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+
+            Column(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Raised).padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Text("Speaker side", color = Ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "For stereo, set one phone to Left and one to Right, and place them that way round.",
+                    color = Muted, fontSize = 13.sp, lineHeight = 19.sp
+                )
+                Row(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Panel).padding(4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    listOf(AudioSyncManager.SIDE_LEFT, AudioSyncManager.SIDE_BOTH, AudioSyncManager.SIDE_RIGHT).forEach { option ->
+                        val selected = side == option
+                        val content = if (selected) Bg else Ink
+                        val off = if (selected) Bg.copy(alpha = 0.25f) else Unplayed
+                        Column(
+                            Modifier
+                                .weight(1f)
+                                .height(64.dp)
+                                .clip(RoundedCornerShape(11.dp))
+                                .background(if (selected) Accent else Color.Transparent)
+                                .clickable { AudioSyncManager.setSpeakerSide(option) }
+                                .semantics { contentDescription = "$option speaker" },
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(6.dp, Alignment.CenterVertically)
+                        ) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                                Box(Modifier.size(12.dp).clip(CircleShape).background(if (option != AudioSyncManager.SIDE_RIGHT) content else off))
+                                Box(Modifier.size(12.dp).clip(CircleShape).background(if (option != AudioSyncManager.SIDE_LEFT) content else off))
+                            }
+                            Text(option, color = content, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
+                Text(
+                    when (side) {
+                        AudioSyncManager.SIDE_LEFT -> "This phone plays only the left channel."
+                        AudioSyncManager.SIDE_RIGHT -> "This phone plays only the right channel."
+                        else -> "This phone plays the full mix, as normal."
+                    } + " Mono songs sound the same either way.",
+                    color = Muted, fontSize = 13.sp, lineHeight = 19.sp
+                )
+            }
 
             Column(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(Raised).padding(16.dp),
