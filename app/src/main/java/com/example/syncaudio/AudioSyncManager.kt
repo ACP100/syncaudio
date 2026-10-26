@@ -116,11 +116,39 @@ object AudioSyncManager {
     private val _playlistIndex = MutableStateFlow(0)
     val playlistIndex: StateFlow<Int> = _playlistIndex.asStateFlow()
 
-    /** Party mode as the host set it: [style] Pulse, Wave or Strobe; [color] an index into the party colours. */
-    data class Party(val style: String, val color: Int)
+    /**
+     * Party mode as this phone sees it. [style]: Pulse, Chase, Message, Lava or Strobe; [color]: an index
+     * into the party colours (4 = a mix); [intensity]: 0..100; [react]: Bass, Song or Vocals; [torch]: flash
+     * the camera light on big beats; [seat]: this phone's place in the line (0 = leftmost) of [seats];
+     * [lineup]: phones show their numbers while the host lines them up; [flashMe]: the host's "Flash it"
+     * is on this phone; [drop]: the host is holding the big flash; [message]: the word for Message.
+     */
+    data class Party(
+        val style: String,
+        val color: Int,
+        val intensity: Int = 70,
+        val react: String = "Bass",
+        val torch: Boolean = false,
+        val seat: Int = 0,
+        val seats: Int = 1,
+        val lineup: Boolean = false,
+        val flashMe: Boolean = false,
+        val drop: Boolean = false,
+        val message: String = "PARTY"
+    )
 
     private val _party = MutableStateFlow<Party?>(null)
     val party: StateFlow<Party?> = _party.asStateFlow()
+
+    // Host side of party mode: the shared settings, and the phones' order left to right
+    const val HOST_SEAT = "host"
+    @Volatile private var partySettings: Party? = null
+    private val _partyOrder = MutableStateFlow<List<String>>(emptyList()) // HOST_SEAT or a joined phone's IP
+    val partyOrder: StateFlow<List<String>> = _partyOrder.asStateFlow()
+    private val phoneNames = ConcurrentHashMap<String, String>()
+    @Volatile private var flashTarget = ""
+    @Volatile private var flashUntil = 0L
+    @Volatile private var dropOn = false
 
     const val SIDE_LEFT = "Left"
     const val SIDE_BOTH = "Both"
@@ -358,39 +386,124 @@ object AudioSyncManager {
         }
     }
 
-    /** Host: turn party mode on for every phone. */
-    fun startParty(style: String, color: Int) {
-        _party.value = Party(style, color)
-        SyncLog.add("Host: party mode $style, colour $color")
+    /** Host: turn party mode on for every phone with [settings]. */
+    fun startParty(settings: Party) {
+        partySettings = settings
+        refreshPartyOrder()
+        publishHostParty()
+        SyncLog.add("Host: party mode ${settings.style}, react to ${settings.react}, intensity ${settings.intensity}")
+    }
+
+    /** Host: change party settings live, e.g. the look or intensity. */
+    fun updateParty(change: (Party) -> Party) {
+        val current = partySettings ?: return
+        partySettings = change(current)
+        publishHostParty()
     }
 
     /** Host: turn party mode off for every phone. */
     fun stopParty() {
+        partySettings = null
+        dropOn = false
         _party.value = null
     }
 
-    /** What SyncServer replies to "PARTY": "PARTY|<style>|<colour>", or "PARTY|" when off. */
-    fun partyReply(): String = _party.value?.let { "PARTY|${it.style}|${it.color}" } ?: "PARTY|"
+    /** Host: the big flash on every phone, for as long as it's held. */
+    fun setDrop(on: Boolean) {
+        dropOn = on
+        publishHostParty()
+    }
 
-    /** Loudness of what this phone is playing right now, 0..1, for party mode. */
+    /** Host: blink one phone for a moment so it can be found while lining up. */
+    fun flashPhone(id: String) {
+        flashTarget = id
+        flashUntil = System.currentTimeMillis() + 1500
+        publishHostParty()
+        Thread {
+            Thread.sleep(1600)
+            publishHostParty()
+        }.start()
+    }
+
+    /** Host: move a phone [delta] places along the line. */
+    fun moveInLine(id: String, delta: Int) {
+        val order = _partyOrder.value.toMutableList()
+        val from = order.indexOf(id)
+        val to = from + delta
+        if (from < 0 || to !in order.indices) return
+        order.removeAt(from)
+        order.add(to, id)
+        _partyOrder.value = order
+        publishHostParty()
+    }
+
+    /** Display name for an entry of [partyOrder]. */
+    fun phoneName(id: String): String = if (id == HOST_SEAT) "${deviceName()} (this phone)" else phoneNames[id] ?: id
+
+    /** Keep the line to the host plus phones that polled recently, keeping the order the host chose. */
+    private fun refreshPartyOrder() {
+        val now = System.currentTimeMillis()
+        val active = joinedPhones.filterValues { now - it < 10_000 }.keys
+        val order = _partyOrder.value.filter { it == HOST_SEAT || it in active }.toMutableList()
+        if (HOST_SEAT !in order) order.add(0, HOST_SEAT)
+        active.forEach { if (it !in order) order.add(it) }
+        if (order != _partyOrder.value) {
+            _partyOrder.value = order
+            publishHostParty()
+        }
+    }
+
+    /** Party as phone [id] should show it, or null when party mode is off. */
+    private fun partyFor(id: String): Party? {
+        val settings = partySettings ?: return null
+        val order = _partyOrder.value
+        return settings.copy(
+            seat = order.indexOf(id).coerceAtLeast(0),
+            seats = order.size.coerceAtLeast(1),
+            flashMe = id == flashTarget && System.currentTimeMillis() < flashUntil,
+            drop = dropOn
+        )
+    }
+
+    private fun publishHostParty() {
+        _party.value = partyFor(HOST_SEAT)
+    }
+
+    /**
+     * What SyncServer replies to "PARTY|<phone name>":
+     * "PARTY|<style>|<colour>|<intensity>|<react>|<torch>|<seat>|<seats>|<lineup>|<flash me>|<drop>|<message>",
+     * or "PARTY|" when off.
+     */
+    fun partyReply(fromIp: String, request: String): String {
+        request.substringAfter("PARTY|", "").takeIf { it.isNotEmpty() }?.let { phoneNames[fromIp] = it }
+        refreshPartyOrder()
+        val p = partyFor(fromIp) ?: return "PARTY|"
+        fun flag(b: Boolean) = if (b) "1" else "0"
+        return "PARTY|${p.style}|${p.color}|${p.intensity}|${p.react}|${flag(p.torch)}|${p.seat}|${p.seats}|" +
+            "${flag(p.lineup)}|${flag(p.flashMe)}|${flag(p.drop)}|${p.message}"
+    }
+
+    /** Loudness of what this phone is playing right now, 0..1, in the range party mode reacts to. */
     fun partyLevel(): Float {
         val song = _nowPlaying.value ?: return 0f
         val position = System.currentTimeMillis() - song.startsAtLocalMs
-        return activePlayers.firstOrNull()?.levelAt(position) ?: 0f
+        val band = when (_party.value?.react) {
+            "Song" -> AudioSyncPlayer.BAND_SONG
+            "Vocals" -> AudioSyncPlayer.BAND_VOCALS
+            else -> AudioSyncPlayer.BAND_BASS
+        }
+        return activePlayers.firstOrNull()?.levelAt(position, band) ?: 0f
     }
 
     /** How far into the song this phone is, in ms (0 when not playing). */
     fun songPositionMs(): Long =
         _nowPlaying.value?.let { (System.currentTimeMillis() - it.startsAtLocalMs).coerceAtLeast(0L) } ?: 0L
 
-    /** This phone's place in a colour wave: the host is 0, joined phones spread by name. */
-    fun partySeat(): Int = if (isHosting) 0 else 1 + (deviceName().hashCode() and 0x7fffffff) % 3
-
     /** Joined phone: follow the host's party mode. Hosts without party mode don't answer; it stays off. */
     private fun partyLoop() {
         while (isListening) {
             try {
-                Thread.sleep(1000)
+                Thread.sleep(300) // often enough that the host's big flash feels immediate
             } catch (e: InterruptedException) {
                 return
             }
@@ -402,17 +515,29 @@ object AudioSyncManager {
             if (!status.isConnected || status.serverIp.isEmpty()) continue
             try {
                 DatagramSocket().use { socket ->
-                    socket.soTimeout = 400
-                    val request = "PARTY".toByteArray()
+                    socket.soTimeout = 250
+                    val request = "PARTY|${deviceName()}".toByteArray()
                     socket.send(DatagramPacket(request, request.size, InetAddress.getByName(status.serverIp), SYNC_SERVER_PORT))
-                    val buffer = ByteArray(128)
+                    val buffer = ByteArray(512)
                     val reply = DatagramPacket(buffer, buffer.size)
                     socket.receive(reply)
                     val parts = String(reply.data, 0, reply.length).split("|")
-                    _party.value = if (parts.size >= 3 && parts[0] == "PARTY") {
-                        Party(parts[1], parts[2].toIntOrNull() ?: 0)
-                    } else {
-                        null
+                    _party.value = when {
+                        parts.size >= 12 && parts[0] == "PARTY" -> Party(
+                            style = parts[1],
+                            color = parts[2].toIntOrNull() ?: 0,
+                            intensity = parts[3].toIntOrNull() ?: 70,
+                            react = parts[4],
+                            torch = parts[5] == "1",
+                            seat = parts[6].toIntOrNull() ?: 0,
+                            seats = parts[7].toIntOrNull() ?: 1,
+                            lineup = parts[8] == "1",
+                            flashMe = parts[9] == "1",
+                            drop = parts[10] == "1",
+                            message = parts.drop(11).joinToString("|")
+                        )
+                        parts.size >= 3 && parts[0] == "PARTY" -> Party(parts[1], parts[2].toIntOrNull() ?: 0)
+                        else -> null
                     }
                 }
             } catch (e: Exception) {

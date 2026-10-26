@@ -27,6 +27,11 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import android.content.Context
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.semantics.contentDescription
@@ -61,7 +66,7 @@ private val Amber = Color(0xFFE8B04A)
 
 private val WAVE = listOf(30, 52, 74, 40, 96, 120, 84, 60, 140, 170, 120, 90, 150, 190, 160, 110, 130, 170, 140, 100, 80, 120, 90, 60, 70, 44, 56, 32)
 
-private enum class Screen { WELCOME, JOIN, HOST, LISTENER }
+private enum class Screen { WELCOME, JOIN, HOST, LISTENER, PARTY_STUDIO, PARTY_LINEUP }
 
 /**
  * The everyday flow: one phone starts a room and picks a song, the others join it from a list,
@@ -96,7 +101,23 @@ fun SimpleSyncScreen(onOpenAdvanced: () -> Unit) {
                     screen = Screen.LISTENER
                 }
             )
+            Screen.PARTY_STUDIO -> PartyStudioScreen(
+                onBack = {
+                    // backing out before the party started cancels it
+                    if (AudioSyncManager.party.value?.lineup == true) AudioSyncManager.stopParty()
+                    screen = Screen.HOST
+                },
+                onNext = { screen = Screen.PARTY_LINEUP }
+            )
+            Screen.PARTY_LINEUP -> PartyLineupScreen(
+                onBack = { screen = Screen.PARTY_STUDIO },
+                onStart = {
+                    AudioSyncManager.updateParty { it.copy(lineup = false) }
+                    screen = Screen.HOST
+                }
+            )
             Screen.HOST -> HostScreen(
+                onParty = { screen = Screen.PARTY_STUDIO },
                 onSettings = { showSettings = true },
                 onLeave = {
                     AudioSyncManager.stopHosting()
@@ -209,7 +230,7 @@ private fun JoinScreen(onBack: () -> Unit, onJoin: (AudioSyncManager.FoundHost) 
 }
 
 @Composable
-private fun HostScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
+private fun HostScreen(onParty: () -> Unit, onSettings: () -> Unit, onLeave: () -> Unit) {
     val context = LocalContext.current
     val activity = context as MainActivity
     val scope = rememberCoroutineScope()
@@ -221,7 +242,6 @@ private fun HostScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
     val index by AudioSyncManager.playlistIndex.collectAsState()
     val now = rememberNow()
     var showQueue by remember { mutableStateOf(false) }
-    var showPartySheet by remember { mutableStateOf(false) }
     val side by AudioSyncManager.speakerSide.collectAsState()
     var joined by remember { mutableStateOf(0) }
     LaunchedEffect(Unit) {
@@ -248,7 +268,7 @@ private fun HostScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
                 SectionLabel("You're hosting")
                 Text(AudioSyncManager.deviceName(), color = Ink, fontSize = 22.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
-            SquareIconButton("Party mode", onClick = { showPartySheet = true }) { PartyIcon() }
+            SquareIconButton("Party mode", onClick = onParty) { PartyIcon() }
             Spacer(Modifier.width(8.dp))
             SquareIconButton("Settings", onClick = onSettings) { SettingsIcon() }
         }
@@ -387,7 +407,6 @@ private fun HostScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
     }
 
     if (showQueue) QueueSheet(onDismiss = { showQueue = false })
-    if (showPartySheet) PartySheet(onDismiss = { showPartySheet = false })
 }
 
 /** The host's playlist: tap a song to switch to it, or add more. */
@@ -936,136 +955,334 @@ private fun StopIcon(color: Color) {
 private val PARTY_COLORS = listOf(Accent, Color(0xFF5B8CFF), Color(0xFFC77DFF), Color(0xFFFF8A3D))
 private const val PARTY_MIX = 4 // colour choice that cycles through all of PARTY_COLORS
 
-private val PARTY_STYLES = listOf("Pulse" to "Pulse", "Wave" to "Colour wave", "Strobe" to "Strobe")
+/** The looks, with what each does. */
+private val PARTY_LOOKS = listOf(
+    "Pulse" to "Every screen flickers brighter on each hit in the music.",
+    "Chase" to "Light runs from phone to phone, in the order you line them up.",
+    "Message" to "Spell a word across the phones, one letter each, flashing to the music.",
+    "Lava" to "Slow, calm colour blobs that swell with the music. For chill songs.",
+    "Strobe" to "Short flashes on big hits, at most 3 a second. Not for anyone sensitive to flashing light."
+)
 
-/** Host: choose a look and start party mode on every phone. */
-@OptIn(ExperimentalMaterial3Api::class)
+private val PARTY_REACT = listOf("Bass" to "Bass", "Song" to "Whole song", "Vocals" to "Vocals")
+
+private fun seatColor(seat: Int) = PARTY_COLORS[seat % PARTY_COLORS.size]
+
+/** Host: choose the look and how it reacts, then line up the phones. */
 @Composable
-private fun PartySheet(onDismiss: () -> Unit) {
+private fun PartyStudioScreen(onBack: () -> Unit, onNext: () -> Unit) {
     val current = AudioSyncManager.party.collectAsState().value
-    var style by remember { mutableStateOf(current?.style ?: "Pulse") }
+    var style by remember { mutableStateOf(current?.style?.takeIf { s -> PARTY_LOOKS.any { it.first == s } } ?: "Pulse") }
     var color by remember { mutableStateOf(current?.color ?: 0) }
+    var react by remember { mutableStateOf(current?.react ?: "Bass") }
+    var intensity by remember { mutableStateOf((current?.intensity ?: 70).toFloat()) }
+    var torch by remember { mutableStateOf(current?.torch ?: false) }
+    var message by remember { mutableStateOf(current?.message ?: "PARTY") }
 
-    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = Panel, contentColor = Ink) {
-        Column(
-            Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 28.dp),
-            verticalArrangement = Arrangement.spacedBy(18.dp)
-        ) {
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("Party mode", color = Ink, fontSize = 24.sp, fontWeight = FontWeight.Bold)
-                Text(
-                    "Every phone's screen lights up to the music, together. Put them face up on a table or hold them up.",
-                    color = Muted, fontSize = 14.sp, lineHeight = 21.sp
-                )
-            }
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(start = 20.dp, end = 20.dp, top = 24.dp, bottom = 28.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            SquareIconButton("Back", onClick = onBack) { BackIcon() }
+            Spacer(Modifier.width(12.dp))
+            Text("Party studio", color = Ink, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        }
 
+        SectionLabel("Look")
+        PARTY_LOOKS.chunked(3).forEach { row ->
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                PARTY_STYLES.forEach { (key, label) ->
+                row.forEach { (key, _) ->
                     val selected = style == key
                     Surface(
                         onClick = { style = key },
-                        shape = RoundedCornerShape(18.dp),
-                        color = Raised,
+                        shape = RoundedCornerShape(16.dp),
+                        color = Panel,
                         border = BorderStroke(2.dp, if (selected) Accent else Color.Transparent),
-                        modifier = Modifier.weight(1f).semantics { contentDescription = label }
+                        modifier = Modifier.weight(1f).semantics { contentDescription = key }
                     ) {
-                        Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                            Box(Modifier.fillMaxWidth().height(96.dp).clip(RoundedCornerShape(12.dp))) {
-                                when (key) {
-                                    "Pulse" -> Box(Modifier.fillMaxSize().background(Accent), contentAlignment = Alignment.Center) {
-                                        Box(Modifier.size(44.dp).clip(CircleShape).background(Bg.copy(alpha = 0.25f)))
-                                    }
-                                    "Wave" -> Row(Modifier.fillMaxSize()) {
-                                        PARTY_COLORS.drop(1).forEach { Box(Modifier.weight(1f).fillMaxHeight().background(it)) }
-                                    }
-                                    else -> Column(Modifier.fillMaxSize()) {
-                                        Box(Modifier.weight(1f).fillMaxWidth().background(Bg))
-                                        Box(Modifier.weight(1f).fillMaxWidth().background(Ink))
-                                    }
-                                }
-                            }
-                            Text(label, color = Ink, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                        Column(Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            LookPreview(key)
+                            Text(key, color = Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                         }
                     }
                 }
+                repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
             }
+        }
+        Text(PARTY_LOOKS.first { it.first == style }.second, color = Muted, fontSize = 13.sp, lineHeight = 19.sp)
 
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                SectionLabel("Colour")
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    (0..PARTY_MIX).forEach { i ->
-                        val selected = color == i
-                        Box(
-                            Modifier
-                                .size(44.dp)
-                                .clip(CircleShape)
-                                .background(if (i < PARTY_COLORS.size) PARTY_COLORS[i] else Raised)
-                                .border(3.dp, if (selected) Ink else Color.Transparent, CircleShape)
-                                .clickable { color = i }
-                                .semantics { contentDescription = if (i < PARTY_COLORS.size) "Colour ${i + 1}" else "Mix of colours" },
-                            contentAlignment = Alignment.Center
-                        ) {
-                            if (i == PARTY_MIX) {
-                                Row {
-                                    PARTY_COLORS.forEach { Box(Modifier.size(width = 6.dp, height = 18.dp).background(it)) }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            Column(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Raised).padding(horizontal = 16.dp, vertical = 14.dp),
-                verticalArrangement = Arrangement.spacedBy(2.dp)
-            ) {
-                Text("Flashing light warning", color = Ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                Text(
-                    "Strobe flashes on loud beats (at most 3 times a second). Use Pulse if anyone is sensitive to flashing light.",
-                    color = Muted, fontSize = 13.sp, lineHeight = 19.sp
+        if (style == "Message") {
+            OutlinedTextField(
+                value = message,
+                onValueChange = { text -> message = text.uppercase().filter { it != '|' }.take(20) },
+                label = { Text("Word to spell") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedTextColor = Ink, unfocusedTextColor = Ink,
+                    focusedBorderColor = Accent, unfocusedBorderColor = Line,
+                    focusedLabelColor = Accent, unfocusedLabelColor = Muted
                 )
-            }
+            )
+        }
 
-            PrimaryButton("Start party mode on all phones") {
-                AudioSyncManager.startParty(style, color)
-                onDismiss()
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            SectionLabel("Colour")
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                (0..PARTY_MIX).forEach { i ->
+                    Box(
+                        Modifier
+                            .size(44.dp)
+                            .clip(CircleShape)
+                            .background(if (i < PARTY_COLORS.size) PARTY_COLORS[i] else Raised)
+                            .border(3.dp, if (color == i) Ink else Color.Transparent, CircleShape)
+                            .clickable { color = i }
+                            .semantics { contentDescription = if (i < PARTY_COLORS.size) "Colour ${i + 1}" else "Mix of colours" },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (i == PARTY_MIX) Row { PARTY_COLORS.forEach { Box(Modifier.size(width = 6.dp, height = 18.dp).background(it)) } }
+                    }
+                }
             }
+        }
+
+        Column(
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Panel).padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text("React to", color = Ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+            Row(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Bg).padding(4.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                PARTY_REACT.forEach { (key, label) ->
+                    val selected = react == key
+                    Box(
+                        Modifier.weight(1f).height(36.dp).clip(RoundedCornerShape(9.dp))
+                            .background(if (selected) Accent else Color.Transparent)
+                            .clickable { react = key },
+                        contentAlignment = Alignment.Center
+                    ) { Text(label, color = if (selected) Bg else Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold) }
+                }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Intensity", color = Ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                Text(intensityLabel(intensity.toInt()), color = Muted, fontSize = 13.sp)
+            }
+            Slider(
+                value = intensity, onValueChange = { intensity = it }, valueRange = 0f..100f,
+                colors = SliderDefaults.colors(thumbColor = Ink, activeTrackColor = Accent, inactiveTrackColor = Line)
+            )
+        }
+
+        Row(
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Panel).padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text("Camera flash on big hits", color = Ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                Text("Uses each phone's torch, at most 3 flashes a second.", color = Muted, fontSize = 13.sp)
+            }
+            Switch(
+                checked = torch, onCheckedChange = { torch = it },
+                colors = SwitchDefaults.colors(checkedTrackColor = Accent, checkedThumbColor = Bg)
+            )
+        }
+
+        PrimaryButton("Next: line up the phones") {
+            AudioSyncManager.startParty(
+                AudioSyncManager.Party(style, color, intensity.toInt(), react, torch, lineup = true, message = message.ifBlank { "PARTY" })
+            )
+            onNext()
         }
     }
 }
 
-/** Full-screen colour that follows the music's loudness; the same on every phone because the music is. */
+private fun intensityLabel(value: Int) = when {
+    value < 34 -> "Calm"
+    value < 67 -> "Lively"
+    else -> "Wild"
+}
+
+/** Small picture of a look for the studio tiles. */
+@Composable
+private fun LookPreview(look: String) {
+    val shape = RoundedCornerShape(10.dp)
+    val modifier = Modifier.fillMaxWidth().height(84.dp).clip(shape)
+    when (look) {
+        "Pulse" -> Box(modifier.background(Accent))
+        "Chase" -> Row(modifier) {
+            Box(Modifier.weight(1f).fillMaxHeight().background(Unplayed))
+            Box(Modifier.weight(1f).fillMaxHeight().background(PARTY_COLORS[1]))
+            Box(Modifier.weight(1f).fillMaxHeight().background(Unplayed))
+        }
+        "Message" -> Box(modifier.background(PARTY_COLORS[2]), contentAlignment = Alignment.Center) {
+            Text("HI", color = Bg, fontSize = 26.sp, fontWeight = FontWeight.Bold)
+        }
+        "Lava" -> Box(
+            modifier.background(
+                Brush.radialGradient(listOf(PARTY_COLORS[3], PARTY_COLORS[2], Color(0xFF2A1838)))
+            )
+        )
+        else -> Column(modifier) {
+            Box(Modifier.weight(1f).fillMaxWidth().background(Ink))
+            Box(Modifier.weight(1f).fillMaxWidth().background(Bg))
+        }
+    }
+}
+
+/** Host: every phone shows its number; put them in order, 1 on the left. */
+@Composable
+private fun PartyLineupScreen(onBack: () -> Unit, onStart: () -> Unit) {
+    val order by AudioSyncManager.partyOrder.collectAsState()
+
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(start = 20.dp, end = 20.dp, top = 24.dp, bottom = 28.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            SquareIconButton("Back", onClick = onBack) { BackIcon() }
+            Spacer(Modifier.width(12.dp))
+            Text("Line up the phones", color = Ink, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        }
+        Text(
+            "Each phone now shows a big number. Put them in a row, 1 on the left, so Chase and Message travel the right way.",
+            color = Muted, fontSize = 14.sp, lineHeight = 21.sp
+        )
+
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally)
+        ) {
+            order.indices.forEach { i ->
+                Box(
+                    Modifier.size(width = 60.dp, height = 108.dp).clip(RoundedCornerShape(14.dp)).background(Raised).padding(4.dp)
+                ) {
+                    Box(Modifier.fillMaxSize().clip(RoundedCornerShape(10.dp)).background(seatColor(i)), contentAlignment = Alignment.Center) {
+                        Text("${i + 1}", color = Bg, fontSize = 32.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            order.forEachIndexed { i, id ->
+                Row(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Panel).padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Box(Modifier.size(32.dp).clip(RoundedCornerShape(10.dp)).background(seatColor(i)), contentAlignment = Alignment.Center) {
+                        Text("${i + 1}", color = Bg, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    }
+                    Text(
+                        AudioSyncManager.phoneName(id), color = Ink, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f)
+                    )
+                    TextButton(onClick = { AudioSyncManager.moveInLine(id, -1) }, enabled = i > 0, contentPadding = PaddingValues(0.dp),
+                        modifier = Modifier.size(36.dp).semantics { contentDescription = "Move left" }) {
+                        Text("▲", color = if (i > 0) Ink else Line)
+                    }
+                    TextButton(onClick = { AudioSyncManager.moveInLine(id, 1) }, enabled = i < order.size - 1, contentPadding = PaddingValues(0.dp),
+                        modifier = Modifier.size(36.dp).semantics { contentDescription = "Move right" }) {
+                        Text("▼", color = if (i < order.size - 1) Ink else Line)
+                    }
+                    OutlinedButton(
+                        onClick = { AudioSyncManager.flashPhone(id) },
+                        border = BorderStroke(1.5.dp, Line), shape = RoundedCornerShape(10.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp)
+                    ) { Text("Flash it", color = Ink, fontSize = 13.sp) }
+                }
+            }
+        }
+        Text(
+            if (order.size < 2) "No other phones yet. Phones that joined show up here within a few seconds."
+            else "Use ▲ ▼ to change the order. \"Flash it\" blinks that phone so you can find it.",
+            color = Faint, fontSize = 13.sp, lineHeight = 19.sp
+        )
+
+        PrimaryButton("Start the party", onClick = onStart)
+    }
+}
+
+/** The camera light, for flashes on big hits; quietly does nothing on phones that won't share it. */
+private class Torch(context: Context) {
+    private val cameras = context.getSystemService(CameraManager::class.java)
+    private val id: String? = try {
+        cameras?.cameraIdList?.firstOrNull {
+            cameras.getCameraCharacteristics(it).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+        }
+    } catch (e: Exception) {
+        null
+    }
+
+    fun set(on: Boolean) {
+        try {
+            id?.let { cameras?.setTorchMode(it, on) }
+        } catch (e: Exception) {
+            // camera busy or not allowed; skip this flash
+        }
+    }
+}
+
+/**
+ * Full-screen light show, the same on every phone: the music drives it (each phone measures the song it
+ * plays in sync), and anything that moves over time uses the song's position, which is in sync too.
+ */
 @Composable
 private fun PartyScreen(party: AudioSyncManager.Party, isHost: Boolean, onExit: () -> Unit) {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val view = LocalView.current
+    val torch = remember { Torch(context) }
     DisposableEffect(Unit) {
         view.keepScreenOn = true
-        onDispose { view.keepScreenOn = false }
+        onDispose {
+            view.keepScreenOn = false
+            torch.set(false)
+        }
     }
+    val currentParty by rememberUpdatedState(party)
 
     val nowPlaying by AudioSyncManager.nowPlaying.collectAsState()
     val paused by AudioSyncManager.paused.collectAsState()
     val drift by AudioSyncManager.driftMs.collectAsState()
-    val playlist by AudioSyncManager.playlist.collectAsState()
-    val index by AudioSyncManager.playlistIndex.collectAsState()
 
     var level by remember { mutableStateOf(0f) }
+    var hit by remember { mutableStateOf(0f) } // how far the music just jumped above its recent average
     var songMs by remember { mutableStateOf(0L) }
     var strobeOn by remember { mutableStateOf(false) }
+    var clock by remember { mutableStateOf(0L) }
     LaunchedEffect(Unit) {
+        var average = 0f
         var lastFlash = 0L
+        var lastTorch = 0L
         while (true) {
             withFrameNanos { }
-            level = AudioSyncManager.partyLevel()
-            songMs = AudioSyncManager.songPositionMs()
-            // Strobe: a short flash on loud moments, at most 3 a second
             val now = System.currentTimeMillis()
-            strobeOn = if (level > 0.75f && now - lastFlash >= 333) {
+            val l = AudioSyncManager.partyLevel()
+            average += (l - average) * 0.04f
+            val h = ((l - average) / (1f - average).coerceAtLeast(0.15f)).coerceIn(0f, 1f)
+            level = l
+            hit = h
+            songMs = AudioSyncManager.songPositionMs()
+            clock = now
+            // Strobe and torch: a short flash on a big hit, at most 3 a second
+            val bigHit = h > 0.45f && l > 0.3f
+            strobeOn = if (bigHit && now - lastFlash >= 333) {
                 lastFlash = now
                 true
             } else {
-                now - lastFlash < 80
+                now - lastFlash < 70
+            }
+            if (currentParty.torch && bigHit && now - lastTorch >= 333) {
+                lastTorch = now
+                torch.set(true)
+                scope.launch {
+                    delay(60)
+                    torch.set(false)
+                }
             }
         }
     }
@@ -1074,20 +1291,31 @@ private fun PartyScreen(party: AudioSyncManager.Party, isHost: Boolean, onExit: 
     var controlsVisible by remember { mutableStateOf(true) }
     LaunchedEffect(controlsShownAt) {
         controlsVisible = true
-        delay(3000)
+        delay(5000)
         controlsVisible = false
     }
 
-    val beat = level * level // quiet parts stay dim, loud parts light up
-    val cycle = (songMs / 4000).toInt() // colours move on every 4 s, in step on every phone
-    val base = when {
-        party.style == "Wave" -> PARTY_COLORS[(AudioSyncManager.partySeat() + cycle) % PARTY_COLORS.size]
-        party.color >= PARTY_COLORS.size -> PARTY_COLORS[cycle % PARTY_COLORS.size]
-        else -> PARTY_COLORS[party.color]
-    }
-    val background = when (party.style) {
-        "Strobe" -> if (strobeOn) base else Bg
-        else -> lerp(Bg, base, 0.2f + 0.8f * beat)
+    val k = party.intensity / 100f
+    val cycle = (songMs / 4000).toInt() // the mix of colours moves on every 4 s, in step on every phone
+    val base = if (party.color >= PARTY_COLORS.size) PARTY_COLORS[(party.seat + cycle) % PARTY_COLORS.size] else PARTY_COLORS[party.color]
+    val blink = (clock / 150) % 2 == 0L
+    val playing = songMs > 0
+
+    // Pulse flickers on each hit rather than following overall loudness, so it reacts fast
+    val pulse = (hit * (0.6f + 0.9f * k)).coerceIn(0f, 1f)
+    val background = when {
+        party.lineup -> if (party.flashMe && blink) Ink else seatColor(party.seat)
+        party.flashMe -> if (blink) Ink else Bg
+        party.drop -> Ink
+        party.style == "Strobe" -> if (strobeOn) base else Bg
+        party.style == "Chase" -> {
+            val stepMs = (800 - 600 * k).toLong().coerceAtLeast(150L)
+            val lit = playing && (songMs / stepMs) % party.seats == party.seat.toLong()
+            if (lit) lerp(Bg, seatColorOr(base, party), 0.55f + 0.45f * level) else lerp(Bg, base, 0.05f)
+        }
+        party.style == "Message" -> lerp(Bg, seatColorOr(base, party), 0.35f + 0.65f * pulse)
+        party.style == "Lava" -> lerp(Bg, base, 0.12f)
+        else -> lerp(Bg, base, 0.06f + 0.94f * pulse)
     }
     val onBackground = if (background.luminance() > 0.4f) Bg else Ink
 
@@ -1097,85 +1325,168 @@ private fun PartyScreen(party: AudioSyncManager.Party, isHost: Boolean, onExit: 
             .background(background)
             .pointerInput(Unit) { detectTapGestures { controlsShownAt = System.currentTimeMillis() } }
     ) {
-        Box(Modifier.align(Alignment.Center), contentAlignment = Alignment.Center) {
-            val ring = 200.dp + 100.dp * beat
-            Box(Modifier.size(ring).clip(CircleShape).background(Color.White.copy(alpha = 0.18f)))
-            Box(Modifier.size(ring * 0.6f).clip(CircleShape).background(Color.White.copy(alpha = 0.32f)))
+        if (party.style == "Lava" && !party.lineup && !party.flashMe && !party.drop) {
+            Canvas(Modifier.fillMaxSize()) {
+                val t = songMs / 1000f
+                val swell = 0.32f + 0.25f * level * (0.5f + k)
+                val second = PARTY_COLORS[(PARTY_COLORS.indexOf(base).coerceAtLeast(0) + 1) % PARTY_COLORS.size]
+                listOf(
+                    Triple(base, 0.6f + party.seat, 0.45f),
+                    Triple(second, 1.9f + party.seat, 0.6f)
+                ).forEach { (c, phase, speed) ->
+                    val center = Offset(
+                        size.width * (0.5f + 0.3f * kotlin.math.sin(t * speed + phase)),
+                        size.height * (0.45f + 0.25f * kotlin.math.cos(t * speed * 0.8f + phase))
+                    )
+                    val radius = size.width * swell
+                    drawCircle(Brush.radialGradient(listOf(c, c.copy(alpha = 0f)), center, radius), radius, center)
+                }
+            }
         }
 
-        Column(
-            Modifier.fillMaxSize().padding(start = 24.dp, end = 24.dp, top = 24.dp, bottom = 36.dp)
-        ) {
-            if (controlsVisible) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    if (isHost) {
-                        val joined = AudioSyncManager.joinedPhoneCount()
-                        Text(
-                            "Party mode · ${joined + 1} phone${if (joined == 0) "" else "s"}",
-                            color = onBackground, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(onBackground.copy(alpha = 0.14f))
-                                .padding(horizontal = 14.dp, vertical = 8.dp)
-                        )
-                    }
-                    Spacer(Modifier.weight(1f))
-                    Box(
-                        Modifier.size(44.dp).clip(CircleShape).background(onBackground.copy(alpha = 0.14f))
-                            .clickable(onClick = onExit)
-                            .semantics { contentDescription = if (isHost) "Exit party mode" else "Exit party mode on this phone" },
-                        contentAlignment = Alignment.Center
-                    ) { CloseIcon(onBackground) }
-                }
+        // Big centre content: the phone's number while lining up, a letter for Message
+        when {
+            party.lineup -> Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("${party.seat + 1}", color = Bg, fontSize = 160.sp, fontWeight = FontWeight.Bold, lineHeight = 160.sp)
+                Text("Phone ${party.seat + 1} of ${party.seats}", color = Bg, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
             }
-            Spacer(Modifier.weight(1f))
-
-            val song = nowPlaying ?: paused?.song
-            Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            party.style == "Message" && !party.flashMe && !party.drop -> {
+                val word = party.message.ifBlank { "PARTY" }
+                val index = if (word.length > party.seats) ((party.seat + songMs / 1000) % word.length).toInt() else party.seat
                 Text(
-                    song?.title ?: "Waiting for the host", color = onBackground, fontSize = 28.sp, fontWeight = FontWeight.Bold,
-                    textAlign = TextAlign.Center, maxLines = 2, overflow = TextOverflow.Ellipsis
+                    word.getOrNull(index)?.toString() ?: "",
+                    color = onBackground, fontSize = 200.sp, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.align(Alignment.Center)
                 )
-                val subtitle = when {
-                    isHost -> song?.artist ?: ""
-                    nowPlaying != null && drift != null -> "In sync · ±${abs(drift!!)} ms"
-                    else -> ""
-                }
-                if (subtitle.isNotEmpty()) Text(subtitle, color = onBackground.copy(alpha = 0.75f), fontSize = 14.sp, fontWeight = FontWeight.Medium)
             }
+        }
 
-            if (isHost && controlsVisible) {
-                Spacer(Modifier.height(24.dp))
-                val active = nowPlaying != null
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(28.dp, Alignment.CenterHorizontally),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(
-                        Modifier.size(52.dp).clip(CircleShape).background(onBackground.copy(alpha = 0.14f))
-                            .clickable { scope.launch { if (index > 0) AudioSyncManager.skip(-1) else AudioSyncManager.playFrom(0L) } }
-                            .semantics { contentDescription = "Previous song" },
-                        contentAlignment = Alignment.Center
-                    ) { SkipIcon(forward = false, color = onBackground) }
-                    Box(
-                        Modifier.size(68.dp).clip(CircleShape).background(onBackground)
-                            .clickable {
-                                when {
-                                    active -> AudioSyncManager.pause()
-                                    paused != null -> scope.launch { AudioSyncManager.playFrom(paused!!.positionMs) }
-                                    else -> scope.launch { AudioSyncManager.playFrom(0L) }
-                                }
-                            }
-                            .semantics { contentDescription = if (active) "Pause for everyone" else "Play for everyone" },
-                        contentAlignment = Alignment.Center
-                    ) { if (active) PauseIcon(background) else PlayIcon(background) }
-                    Box(
-                        Modifier.size(52.dp).clip(CircleShape).background(onBackground.copy(alpha = 0.14f))
-                            .clickable { scope.launch { AudioSyncManager.skip(1) } }
-                            .semantics { contentDescription = "Next song" },
-                        contentAlignment = Alignment.Center
-                    ) { SkipIcon(forward = true, color = if (index + 1 < playlist.size) onBackground else onBackground.copy(alpha = 0.3f)) }
+        if (!party.lineup) {
+            Column(Modifier.fillMaxSize().padding(start = 20.dp, end = 20.dp, top = 24.dp, bottom = 28.dp)) {
+                if (controlsVisible && !isHost) {
+                    Row {
+                        Spacer(Modifier.weight(1f))
+                        Box(
+                            Modifier.size(44.dp).clip(CircleShape).background(onBackground.copy(alpha = 0.14f))
+                                .clickable(onClick = onExit)
+                                .semantics { contentDescription = "Exit party mode on this phone" },
+                            contentAlignment = Alignment.Center
+                        ) { CloseIcon(onBackground) }
+                    }
                 }
+                Spacer(Modifier.weight(1f))
+                if (!isHost && party.style != "Message") {
+                    val song = nowPlaying ?: paused?.song
+                    Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            song?.title ?: "Waiting for the host", color = onBackground, fontSize = 24.sp, fontWeight = FontWeight.Bold,
+                            textAlign = TextAlign.Center, maxLines = 2, overflow = TextOverflow.Ellipsis
+                        )
+                        val d = drift
+                        if (nowPlaying != null && d != null) {
+                            Text("In sync · ±${abs(d)} ms", color = onBackground.copy(alpha = 0.75f), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
+                if (isHost && controlsVisible) PartyControls(party, onExit)
             }
+        }
+    }
+}
+
+/** A Chase or Message phone in a mix keeps its own colour, so the line reads as different phones. */
+private fun seatColorOr(base: Color, party: AudioSyncManager.Party) =
+    if (party.color >= PARTY_COLORS.size) seatColor(party.seat) else base
+
+/** Host's live panel: the song, the look, intensity, the big flash, and End. */
+@Composable
+private fun PartyControls(party: AudioSyncManager.Party, onExit: () -> Unit) {
+    val scope = rememberCoroutineScope()
+    val nowPlaying by AudioSyncManager.nowPlaying.collectAsState()
+    val paused by AudioSyncManager.paused.collectAsState()
+    val playlist by AudioSyncManager.playlist.collectAsState()
+    val index by AudioSyncManager.playlistIndex.collectAsState()
+    var intensity by remember { mutableStateOf(party.intensity.toFloat()) }
+    val song = nowPlaying ?: paused?.song
+    val active = nowPlaying != null
+
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(24.dp)).background(Bg.copy(alpha = 0.92f)).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(Modifier.weight(1f)) {
+                Text(song?.title ?: "No song playing", color = Ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text("Party on ${party.seats} phone${if (party.seats == 1) "" else "s"}", color = Muted, fontSize = 12.sp)
+            }
+            Box(
+                Modifier.size(48.dp).clip(CircleShape).background(Ink)
+                    .clickable {
+                        when {
+                            active -> AudioSyncManager.pause()
+                            paused != null -> scope.launch { AudioSyncManager.playFrom(paused!!.positionMs) }
+                            else -> scope.launch { AudioSyncManager.playFrom(0L) }
+                        }
+                    }
+                    .semantics { contentDescription = if (active) "Pause for everyone" else "Play for everyone" },
+                contentAlignment = Alignment.Center
+            ) { if (active) PauseIcon(Bg) else PlayIcon(Bg, 22.dp) }
+            val hasNext = index + 1 < playlist.size
+            Box(
+                Modifier.size(48.dp).clip(CircleShape).background(Raised)
+                    .clickable(enabled = hasNext) { scope.launch { AudioSyncManager.skip(1) } }
+                    .semantics { contentDescription = "Next song" },
+                contentAlignment = Alignment.Center
+            ) { SkipIcon(forward = true, color = if (hasNext) Ink else Line) }
+        }
+
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            PARTY_LOOKS.forEach { (key, _) ->
+                val selected = party.style == key
+                Text(
+                    key, color = if (selected) Bg else Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.clip(RoundedCornerShape(18.dp)).background(if (selected) Ink else Raised)
+                        .clickable { AudioSyncManager.updateParty { it.copy(style = key) } }
+                        .padding(horizontal = 14.dp, vertical = 8.dp)
+                )
+            }
+        }
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Intensity", color = Ink, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.width(72.dp))
+            Slider(
+                value = intensity,
+                onValueChange = { intensity = it },
+                onValueChangeFinished = { AudioSyncManager.updateParty { it.copy(intensity = intensity.toInt()) } },
+                valueRange = 0f..100f,
+                colors = SliderDefaults.colors(thumbColor = Ink, activeTrackColor = Accent, inactiveTrackColor = Line),
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Box(
+                Modifier
+                    .weight(1f)
+                    .height(52.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Accent)
+                    .pointerInput(Unit) {
+                        detectTapGestures(onPress = {
+                            AudioSyncManager.setDrop(true)
+                            tryAwaitRelease()
+                            AudioSyncManager.setDrop(false)
+                        })
+                    }
+                    .semantics { contentDescription = "Hold for a big flash on every phone" },
+                contentAlignment = Alignment.Center
+            ) { Text("Hold for a big flash", color = Bg, fontSize = 16.sp, fontWeight = FontWeight.Bold) }
+            OutlinedButton(
+                onClick = onExit,
+                modifier = Modifier.height(52.dp),
+                shape = RoundedCornerShape(16.dp),
+                border = BorderStroke(1.5.dp, Line)
+            ) { Text("End", color = Ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
         }
     }
 }

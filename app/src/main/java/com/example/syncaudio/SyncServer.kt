@@ -55,9 +55,10 @@ object SyncServer {
                             continue
                         }
                         // Joined phones asking whether party mode is on
-                        if (packet.length == 5 && String(packet.data, 0, 5) == "PARTY") {
+                        if (packet.length >= 5 && String(packet.data, 0, 5) == "PARTY") {
                             if (AudioSyncManager.isHosting) {
-                                val reply = AudioSyncManager.partyReply().toByteArray()
+                                val request = String(packet.data, 0, packet.length)
+                                val reply = AudioSyncManager.partyReply(packet.address.hostAddress ?: "", request).toByteArray()
                                 serverSocket?.send(DatagramPacket(reply, reply.size, packet.address, packet.port))
                             }
                             continue

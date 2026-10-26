@@ -33,15 +33,17 @@ class AudioSyncPlayer(private val context: Context) {
     @Volatile private var track: AudioTrack? = null
 
     // Loudness of the song every LEVEL_STEP_MS, filled in as it is decoded (a little ahead of what's
-    // heard). Party mode flashes to it; every phone decodes the same file, so they flash together.
-    private val levels = FloatArray(LEVEL_SLOTS)
-    @Volatile private var peakLevel = 0f
+    // heard), for the whole mix and for the bass and vocal ranges. Party mode flashes to it; every
+    // phone decodes the same file the same way, so they flash together.
+    private val levels = Array(BANDS) { FloatArray(LEVEL_SLOTS) }
+    private val peakLevels = FloatArray(BANDS)
 
-    /** Loudness at [songMs] into the song, 0..1 relative to the loudest part so far. */
-    fun levelAt(songMs: Long): Float {
+    /** Loudness of [band] (BAND_SONG, BAND_BASS, BAND_VOCALS) at [songMs], 0..1 relative to its loudest so far. */
+    fun levelAt(songMs: Long, band: Int = BAND_SONG): Float {
         val slot = (songMs / LEVEL_STEP_MS).toInt()
-        if (slot !in levels.indices || peakLevel <= 0f) return 0f
-        return (levels[slot] / peakLevel).coerceIn(0f, 1f)
+        val peak = peakLevels[band]
+        if (slot !in levels[band].indices || peak <= 0f) return 0f
+        return (levels[band][slot] / peak).coerceIn(0f, 1f)
     }
 
     companion object {
@@ -59,8 +61,12 @@ class AudioSyncPlayer(private val context: Context) {
         private const val CODEC_TIMEOUT_US = 10_000L
         private const val QUIET_DECISIONS_PER_LOG = 5
         private const val RATE_LOG_EVERY_MS = 30_000L
-        private const val LEVEL_STEP_MS = 20L
-        private const val LEVEL_SLOTS = 60_000 // 20 minutes of song
+        private const val LEVEL_STEP_MS = 10L
+        private const val LEVEL_SLOTS = 120_000 // 20 minutes of song
+        const val BAND_SONG = 0
+        const val BAND_BASS = 1
+        const val BAND_VOCALS = 2
+        private const val BANDS = 3
     }
 
     /** Checks that the file has an audio track we can decode. Returns false if it cannot be opened. */
@@ -478,28 +484,48 @@ class AudioSyncPlayer(private val context: Context) {
             }
         }
 
-        /** Note this buffer's loudness (RMS of every 4th sample) in [levels] for the song time it covers. */
+        // Simple one-pole filters, kept across buffers: below ~150 Hz for bass, ~300 Hz-3 kHz for vocals
+        private var lowBass = 0.0
+        private var lowVocal = 0.0
+        private var highVocal = 0.0
+        private val bassCoef = 1 - kotlin.math.exp(-2 * Math.PI * 150 / sampleRate)
+        private val vocalLowCoef = 1 - kotlin.math.exp(-2 * Math.PI * 300 / sampleRate)
+        private val vocalHighCoef = 1 - kotlin.math.exp(-2 * Math.PI * 3000 / sampleRate)
+        private val framesPerSlot = (sampleRate * LEVEL_STEP_MS / 1000).toInt().coerceAtLeast(1)
+
+        /** Note this buffer's loudness, per LEVEL_STEP_MS and per band, in [levels] for the song time it covers. */
         private fun recordLevel(pcm: ByteArray, firstFrame: Long, frames: Int) {
             if (bytesPerSample != 2 && !isFloat) return
             val buffer = ByteBuffer.wrap(pcm).order(ByteOrder.nativeOrder())
-            val samples = pcm.size / bytesPerSample
-            var sum = 0.0
+            val sums = DoubleArray(BANDS)
             var count = 0
-            var i = 0
-            while (i < samples) {
-                val v = if (isFloat) buffer.getFloat(i * 4).toDouble() else buffer.getShort(i * 2) / 32768.0
-                sum += v * v
+            for (f in 0 until frames) {
+                var mono = 0.0
+                for (c in 0 until channels) {
+                    val at = (f * channels + c) * bytesPerSample
+                    mono += if (isFloat) buffer.getFloat(at).toDouble() else buffer.getShort(at) / 32768.0
+                }
+                mono /= channels
+                lowBass += bassCoef * (mono - lowBass)
+                lowVocal += vocalLowCoef * (mono - lowVocal)
+                highVocal += vocalHighCoef * (mono - highVocal)
+                val vocal = highVocal - lowVocal
+                sums[BAND_SONG] += mono * mono
+                sums[BAND_BASS] += lowBass * lowBass
+                sums[BAND_VOCALS] += vocal * vocal
                 count++
-                i += 4
+                val frame = firstFrame + f
+                if ((frame + 1) % framesPerSlot == 0L || f == frames - 1) {
+                    val slot = (frame / framesPerSlot).toInt()
+                    for (band in 0 until BANDS) {
+                        val rms = sqrt(sums[band] / count).toFloat()
+                        if (slot in levels[band].indices) levels[band][slot] = rms
+                        if (rms > peakLevels[band]) peakLevels[band] = rms
+                        sums[band] = 0.0
+                    }
+                    count = 0
+                }
             }
-            if (count == 0) return
-            val rms = sqrt(sum / count).toFloat()
-            val firstSlot = (firstFrame * 1000 / sampleRate / LEVEL_STEP_MS).toInt()
-            val lastSlot = ((firstFrame + frames) * 1000 / sampleRate / LEVEL_STEP_MS).toInt()
-            for (slot in firstSlot..lastSlot) {
-                if (slot in levels.indices) levels[slot] = rms
-            }
-            if (rms > peakLevel) peakLevel = rms
         }
 
         /** Scales [count] frames from [startFrame] by a gain going linearly from [from] to [to]. */
