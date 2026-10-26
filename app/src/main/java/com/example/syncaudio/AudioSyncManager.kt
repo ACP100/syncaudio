@@ -116,6 +116,12 @@ object AudioSyncManager {
     private val _playlistIndex = MutableStateFlow(0)
     val playlistIndex: StateFlow<Int> = _playlistIndex.asStateFlow()
 
+    /** Party mode as the host set it: [style] Pulse, Wave or Strobe; [color] an index into the party colours. */
+    data class Party(val style: String, val color: Int)
+
+    private val _party = MutableStateFlow<Party?>(null)
+    val party: StateFlow<Party?> = _party.asStateFlow()
+
     /** A phone hosting on this Wi-Fi, found by [startDiscovery]. */
     data class FoundHost(val ip: String, val name: String, val listeners: Int)
 
@@ -184,6 +190,7 @@ object AudioSyncManager {
         isHosting = false
         SyncServer.stop()
         songServer.stop()
+        stopParty()
         nextSongServer.stop()
         holdLowLatencyWifi(false)
         setStatus("Idle")
@@ -330,6 +337,69 @@ object AudioSyncManager {
                 kotlinx.coroutines.runBlocking { skip(1) }
             } else {
                 stopEveryone()
+            }
+        }
+    }
+
+    /** Host: turn party mode on for every phone. */
+    fun startParty(style: String, color: Int) {
+        _party.value = Party(style, color)
+        SyncLog.add("Host: party mode $style, colour $color")
+    }
+
+    /** Host: turn party mode off for every phone. */
+    fun stopParty() {
+        _party.value = null
+    }
+
+    /** What SyncServer replies to "PARTY": "PARTY|<style>|<colour>", or "PARTY|" when off. */
+    fun partyReply(): String = _party.value?.let { "PARTY|${it.style}|${it.color}" } ?: "PARTY|"
+
+    /** Loudness of what this phone is playing right now, 0..1, for party mode. */
+    fun partyLevel(): Float {
+        val song = _nowPlaying.value ?: return 0f
+        val position = System.currentTimeMillis() - song.startsAtLocalMs
+        return activePlayers.firstOrNull()?.levelAt(position) ?: 0f
+    }
+
+    /** How far into the song this phone is, in ms (0 when not playing). */
+    fun songPositionMs(): Long =
+        _nowPlaying.value?.let { (System.currentTimeMillis() - it.startsAtLocalMs).coerceAtLeast(0L) } ?: 0L
+
+    /** This phone's place in a colour wave: the host is 0, joined phones spread by name. */
+    fun partySeat(): Int = if (isHosting) 0 else 1 + (deviceName().hashCode() and 0x7fffffff) % 3
+
+    /** Joined phone: follow the host's party mode. Hosts without party mode don't answer; it stays off. */
+    private fun partyLoop() {
+        while (isListening) {
+            try {
+                Thread.sleep(1000)
+            } catch (e: InterruptedException) {
+                return
+            }
+            if (!isJoining) {
+                if (!isHosting) _party.value = null
+                continue
+            }
+            val status = ConnectionManager.connectionStatus.value
+            if (!status.isConnected || status.serverIp.isEmpty()) continue
+            try {
+                DatagramSocket().use { socket ->
+                    socket.soTimeout = 400
+                    val request = "PARTY".toByteArray()
+                    socket.send(DatagramPacket(request, request.size, InetAddress.getByName(status.serverIp), SYNC_SERVER_PORT))
+                    val buffer = ByteArray(128)
+                    val reply = DatagramPacket(buffer, buffer.size)
+                    socket.receive(reply)
+                    val parts = String(reply.data, 0, reply.length).split("|")
+                    _party.value = if (parts.size >= 3 && parts[0] == "PARTY") {
+                        Party(parts[1], parts[2].toIntOrNull() ?: 0)
+                    } else {
+                        null
+                    }
+                }
+            } catch (e: Exception) {
+                // no answer this time; keep the last known state
             }
         }
     }
@@ -551,6 +621,7 @@ object AudioSyncManager {
         }.start()
 
         Thread { pollLoop() }.start()
+        Thread { partyLoop() }.start()
     }
 
     /**

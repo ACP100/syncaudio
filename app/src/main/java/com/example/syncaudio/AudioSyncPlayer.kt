@@ -16,6 +16,7 @@ import java.nio.ByteOrder
 import kotlin.math.abs
 import kotlin.math.min
 import kotlin.math.roundToLong
+import kotlin.math.sqrt
 
 /**
  * Plays a song so that it lines up with a shared clock.
@@ -30,6 +31,18 @@ class AudioSyncPlayer(private val context: Context) {
     @Volatile private var source: Uri? = null
     @Volatile private var stopped = false
     @Volatile private var track: AudioTrack? = null
+
+    // Loudness of the song every LEVEL_STEP_MS, filled in as it is decoded (a little ahead of what's
+    // heard). Party mode flashes to it; every phone decodes the same file, so they flash together.
+    private val levels = FloatArray(LEVEL_SLOTS)
+    @Volatile private var peakLevel = 0f
+
+    /** Loudness at [songMs] into the song, 0..1 relative to the loudest part so far. */
+    fun levelAt(songMs: Long): Float {
+        val slot = (songMs / LEVEL_STEP_MS).toInt()
+        if (slot !in levels.indices || peakLevel <= 0f) return 0f
+        return (levels[slot] / peakLevel).coerceIn(0f, 1f)
+    }
 
     companion object {
         private const val TAG = "AudioSync"
@@ -46,6 +59,8 @@ class AudioSyncPlayer(private val context: Context) {
         private const val CODEC_TIMEOUT_US = 10_000L
         private const val QUIET_DECISIONS_PER_LOG = 5
         private const val RATE_LOG_EVERY_MS = 30_000L
+        private const val LEVEL_STEP_MS = 20L
+        private const val LEVEL_SLOTS = 60_000 // 20 minutes of song
     }
 
     /** Checks that the file has an audio track we can decode. Returns false if it cannot be opened. */
@@ -343,7 +358,7 @@ class AudioSyncPlayer(private val context: Context) {
      * applied at the next buffer: fade out, insert silence or skip frames, fade back in.
      */
     private inner class Writer(
-        sampleRate: Int,
+        private val sampleRate: Int,
         private val channels: Int,
         private val bytesPerSample: Int,
         private val isFloat: Boolean
@@ -389,6 +404,7 @@ class AudioSyncPlayer(private val context: Context) {
 
         fun writeSong(pcm: ByteArray) {
             val frames = pcm.size / frameSize
+            recordLevel(pcm, nextSongFrame, frames)
             var pos = 0
             if ((pendingInsert > 0 || pendingDrop > 0) && !dropping) {
                 val fade = min(fadeFrames, frames)
@@ -443,6 +459,30 @@ class AudioSyncPlayer(private val context: Context) {
             write(pcm, startFrame * frameSize, count * frameSize)
             nextSongFrame += count
             written += count
+        }
+
+        /** Note this buffer's loudness (RMS of every 4th sample) in [levels] for the song time it covers. */
+        private fun recordLevel(pcm: ByteArray, firstFrame: Long, frames: Int) {
+            if (bytesPerSample != 2 && !isFloat) return
+            val buffer = ByteBuffer.wrap(pcm).order(ByteOrder.nativeOrder())
+            val samples = pcm.size / bytesPerSample
+            var sum = 0.0
+            var count = 0
+            var i = 0
+            while (i < samples) {
+                val v = if (isFloat) buffer.getFloat(i * 4).toDouble() else buffer.getShort(i * 2) / 32768.0
+                sum += v * v
+                count++
+                i += 4
+            }
+            if (count == 0) return
+            val rms = sqrt(sum / count).toFloat()
+            val firstSlot = (firstFrame * 1000 / sampleRate / LEVEL_STEP_MS).toInt()
+            val lastSlot = ((firstFrame + frames) * 1000 / sampleRate / LEVEL_STEP_MS).toInt()
+            for (slot in firstSlot..lastSlot) {
+                if (slot in levels.indices) levels[slot] = rms
+            }
+            if (rms > peakLevel) peakLevel = rms
         }
 
         /** Scales [count] frames from [startFrame] by a gain going linearly from [from] to [to]. */
