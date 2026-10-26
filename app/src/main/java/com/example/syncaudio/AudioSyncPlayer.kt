@@ -125,6 +125,13 @@ class AudioSyncPlayer(private val context: Context) {
         val decoder = Decoder(uri)
         var audioTrack: AudioTrack? = null
         try {
+            // Starting mid-song (resume, seek, joining late): jump to about where the song will be once
+            // the output is ready; the start alignment then skips the rest exactly
+            val positionAtStartMs = System.currentTimeMillis() + LEAD_IN_MS - (targetTime - currentOffset() + extraDelayMs())
+            if (positionAtStartMs > 1000) {
+                decoder.seekTo((positionAtStartMs - 500) * 1000)
+                SyncLog.add("Player: starting ${positionAtStartMs / 1000} s into the song")
+            }
             val first = decoder.next() ?: return
             val format = decoder.outputFormat
             val sampleRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
@@ -494,6 +501,11 @@ class AudioSyncPlayer(private val context: Context) {
             codec = MediaCodec.createDecoderByType(mime)
             codec.configure(outputFormat, null, null, 0)
             codec.start()
+        }
+
+        /** Before the first [next]: start decoding near [us] into the song. */
+        fun seekTo(us: Long) {
+            extractor.seekTo(us, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
         }
 
         /** Next decoded buffer, or null at the end of the song. */

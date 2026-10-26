@@ -170,10 +170,10 @@ class MainActivity : ComponentActivity() {
             requestCode = requestCode,
             resultCode = resultCode,
             data = data,
-            onFilePicked = { uri ->
-                DebugUtils.log("✅ File selected: $uri")
-                // **Correctly store in FileSelectionManager**
-                FileSelectionManager.setSelectedFile(uri)
+            onFilePicked = { uris ->
+                DebugUtils.log("✅ ${uris.size} file(s) selected")
+                // The picked songs become the host's playlist; the first is selected
+                AudioSyncManager.setPlaylist(uris)
             }
         )
     }

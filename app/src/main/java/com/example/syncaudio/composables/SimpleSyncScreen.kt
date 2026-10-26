@@ -5,6 +5,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -21,6 +22,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
@@ -198,6 +200,9 @@ private fun HostScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
     val songUri by FileSelectionManager.selectedFileUri.collectAsState()
     val pickedName = remember(songUri) { songUri?.let { AudioSyncManager.trackName(context, it).substringBeforeLast('.') } }
     val nowPlaying by AudioSyncManager.nowPlaying.collectAsState()
+    val paused by AudioSyncManager.paused.collectAsState()
+    val playlist by AudioSyncManager.playlist.collectAsState()
+    val index by AudioSyncManager.playlistIndex.collectAsState()
     val now = rememberNow()
     var joined by remember { mutableStateOf(0) }
     LaunchedEffect(Unit) {
@@ -207,12 +212,17 @@ private fun HostScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
         }
     }
 
+    val song = nowPlaying ?: paused?.song
     val playing = nowPlaying?.takeIf { isPlaying(it, now) }
-    val progress = playing?.let { progressOf(it, now) } ?: 0f
+    val starting = nowPlaying?.let { it.startsAtLocalMs > now } ?: false
+    val active = playing != null || starting
+    val position = paused?.positionMs ?: playing?.let { now - it.startsAtLocalMs } ?: 0L
+    val duration = song?.durationMs ?: 0L
+    val progress = if (duration > 0) (position.toFloat() / duration).coerceIn(0f, 1f) else 0f
 
     Column(
         Modifier.fillMaxSize().padding(start = 24.dp, end = 24.dp, top = 24.dp, bottom = 36.dp),
-        verticalArrangement = Arrangement.spacedBy(22.dp)
+        verticalArrangement = Arrangement.spacedBy(20.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
@@ -239,7 +249,7 @@ private fun HostScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
         }
 
         Box(
-            Modifier.fillMaxWidth().height(260.dp).clip(RoundedCornerShape(24.dp)).background(Panel),
+            Modifier.fillMaxWidth().height(240.dp).clip(RoundedCornerShape(24.dp)).background(Panel),
             contentAlignment = Alignment.Center
         ) {
             val played = (progress * WAVE.size).toInt()
@@ -247,45 +257,69 @@ private fun HostScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
         }
 
         SongTitle(
-            title = playing?.title ?: pickedName ?: "No song picked",
-            artist = playing?.artist ?: if (songUri == null) "Pick a song to play for everyone" else ""
+            title = song?.title ?: pickedName ?: "No song picked",
+            artist = song?.artist ?: if (songUri == null) "Pick songs to play for everyone" else ""
         )
-        ProgressBar(playing, now)
+        ProgressBar(
+            positionMs = position,
+            durationMs = duration,
+            onSeek = if (song != null) { pos: Long -> scope.launch { AudioSyncManager.playFrom(pos) }; Unit } else null
+        )
 
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
-            val isOn = nowPlaying != null && (playing != null || nowPlaying!!.startsAtLocalMs > now)
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(32.dp, Alignment.CenterHorizontally),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(
+                onClick = { scope.launch { if (index > 0) AudioSyncManager.skip(-1) else AudioSyncManager.playFrom(0L) } },
+                enabled = index > 0 || song != null,
+                modifier = Modifier.size(52.dp).semantics { contentDescription = "Previous song" }
+            ) { SkipIcon(forward = false, color = if (index > 0 || song != null) Ink else Line) }
+
+            val canPlay = active || songUri != null
             Box(
                 Modifier
                     .size(76.dp)
                     .clip(CircleShape)
-                    .background(if (songUri == null && !isOn) Line else Accent)
-                    .semantics { contentDescription = if (isOn) "Stop for everyone" else "Play for everyone" },
+                    .background(if (canPlay) Accent else Line)
+                    .semantics { contentDescription = if (active) "Pause for everyone" else "Play for everyone" },
                 contentAlignment = Alignment.Center
             ) {
                 IconButton(
                     onClick = {
-                        if (isOn) {
-                            AudioSyncManager.stopEveryone()
-                        } else {
-                            songUri?.let { uri -> scope.launch { AudioSyncManager.broadcastPlayCommand(uri, delayMs = 3000L) } }
+                        when {
+                            active -> AudioSyncManager.pause()
+                            paused != null -> scope.launch { AudioSyncManager.playFrom(paused!!.positionMs) }
+                            else -> scope.launch { AudioSyncManager.playFrom(0L) }
                         }
                     },
-                    enabled = isOn || songUri != null,
+                    enabled = canPlay,
                     modifier = Modifier.fillMaxSize()
                 ) {
-                    if (isOn) StopIcon(Bg) else PlayIcon(if (songUri == null) Faint else Bg)
+                    if (active) PauseIcon(Bg) else PlayIcon(if (canPlay) Bg else Faint)
                 }
             }
-        }
-        if (nowPlaying != null && playing == null && nowPlaying!!.startsAtLocalMs > now) {
-            Text(
-                "Starting on every phone…",
-                color = Muted, fontSize = 13.sp, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth()
-            )
+
+            val hasNext = index + 1 < playlist.size
+            IconButton(
+                onClick = { scope.launch { AudioSyncManager.skip(1) } },
+                enabled = hasNext,
+                modifier = Modifier.size(52.dp).semantics { contentDescription = "Next song" }
+            ) { SkipIcon(forward = true, color = if (hasNext) Ink else Line) }
         }
 
+        Text(
+            when {
+                starting -> "Starting on every phone…"
+                playlist.size > 1 -> "Song ${index + 1} of ${playlist.size}"
+                else -> ""
+            },
+            color = Muted, fontSize = 13.sp, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth()
+        )
+
         Spacer(Modifier.weight(1f))
-        SecondaryButton(if (songUri == null) "Pick a song" else "Change song", height = 52.dp) {
+        SecondaryButton(if (songUri == null) "Pick songs" else "Change songs", height = 52.dp) {
             FilePickerHelper.openAudioPicker(activity)
         }
         TextButton(onClick = onLeave, modifier = Modifier.align(Alignment.CenterHorizontally)) {
@@ -342,7 +376,10 @@ private fun ListenerScreen(onSettings: () -> Unit, onLeave: () -> Unit) {
                 artist = playing?.artist ?: "",
                 centered = true
             )
-            ProgressBar(playing, now)
+            ProgressBar(
+                positionMs = playing?.let { now - it.startsAtLocalMs } ?: 0L,
+                durationMs = playing?.durationMs ?: 0L
+            )
         }
 
         Text(
@@ -424,9 +461,6 @@ private fun isPlaying(song: AudioSyncManager.NowPlaying, now: Long): Boolean {
     return elapsed >= 0 && (song.durationMs <= 0 || elapsed < song.durationMs)
 }
 
-private fun progressOf(song: AudioSyncManager.NowPlaying, now: Long): Float =
-    if (song.durationMs <= 0) 0f else ((now - song.startsAtLocalMs).toFloat() / song.durationMs).coerceIn(0f, 1f)
-
 private fun formatTime(ms: Long): String {
     val seconds = (ms / 1000).coerceAtLeast(0)
     return "%d:%02d".format(seconds / 60, seconds % 60)
@@ -445,17 +479,32 @@ private fun SongTitle(title: String, artist: String, centered: Boolean = false) 
     }
 }
 
+/** Song position bar; with [onSeek], tapping it jumps there (for everyone, on the host). */
 @Composable
-private fun ProgressBar(song: AudioSyncManager.NowPlaying?, now: Long) {
-    val elapsed = song?.let { now - it.startsAtLocalMs } ?: 0L
-    val fraction = song?.let { progressOf(it, now) } ?: 0f
-    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Box(Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)).background(Line)) {
-            Box(Modifier.fillMaxWidth(fraction).height(4.dp).clip(RoundedCornerShape(2.dp)).background(Ink))
+private fun ProgressBar(positionMs: Long, durationMs: Long, onSeek: ((Long) -> Unit)? = null) {
+    val fraction = if (durationMs > 0) (positionMs.toFloat() / durationMs).coerceIn(0f, 1f) else 0f
+    val seek by rememberUpdatedState(onSeek)
+    val duration by rememberUpdatedState(durationMs)
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(24.dp)
+                .pointerInput(Unit) {
+                    detectTapGestures { tap ->
+                        val onTap = seek ?: return@detectTapGestures
+                        if (duration > 0) onTap((tap.x / size.width * duration).toLong().coerceIn(0L, (duration - 1000).coerceAtLeast(0L)))
+                    }
+                },
+            contentAlignment = Alignment.CenterStart
+        ) {
+            Box(Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)).background(Line)) {
+                Box(Modifier.fillMaxWidth(fraction).height(4.dp).clip(RoundedCornerShape(2.dp)).background(Ink))
+            }
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text(formatTime(elapsed), color = Faint, fontSize = 12.sp)
-            Text(formatTime(song?.durationMs ?: 0L), color = Faint, fontSize = 12.sp)
+            Text(formatTime(positionMs), color = Faint, fontSize = 12.sp)
+            Text(formatTime(durationMs), color = Faint, fontSize = 12.sp)
         }
     }
 }
@@ -556,6 +605,36 @@ private fun PlayIcon(color: Color) {
             close()
         }
         drawPath(path, color)
+    }
+}
+
+@Composable
+private fun PauseIcon(color: Color) {
+    Canvas(Modifier.size(28.dp)) {
+        val barWidth = size.width * 0.18f
+        val radius = androidx.compose.ui.geometry.CornerRadius(2.dp.toPx())
+        drawRoundRect(color, Offset(size.width * 0.22f, size.height * 0.18f), Size(barWidth, size.height * 0.64f), radius)
+        drawRoundRect(color, Offset(size.width * 0.60f, size.height * 0.18f), Size(barWidth, size.height * 0.64f), radius)
+    }
+}
+
+/** Previous / next: a triangle against a bar. */
+@Composable
+private fun SkipIcon(forward: Boolean, color: Color) {
+    Canvas(Modifier.size(26.dp)) {
+        val w = size.width
+        val h = size.height
+        val tip = if (forward) w * 0.72f else w * 0.28f
+        val base = if (forward) w * 0.25f else w * 0.75f
+        val path = Path().apply {
+            moveTo(base, h * 0.22f)
+            lineTo(tip, h * 0.5f)
+            lineTo(base, h * 0.78f)
+            close()
+        }
+        drawPath(path, color)
+        val barX = if (forward) w * 0.74f else w * 0.18f
+        drawRoundRect(color, Offset(barX, h * 0.22f), Size(w * 0.08f, h * 0.56f), androidx.compose.ui.geometry.CornerRadius(1.dp.toPx()))
     }
 }
 

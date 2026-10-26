@@ -30,8 +30,6 @@ import java.util.concurrent.ConcurrentHashMap
 object AudioSyncManager {
 
     private const val SYNC_PORT = 5004 // separate port for audio commands
-    // The player can start late in sync by skipping ahead; past this, the song would start noticeably cut
-    private const val MAX_LATE_MS = 1500L
 
     @Volatile private var isListening = false
     private var listenerSocket: DatagramSocket? = null
@@ -91,6 +89,18 @@ object AudioSyncManager {
     private val _driftMs = MutableStateFlow<Long?>(null)
     val driftMs: StateFlow<Long?> = _driftMs.asStateFlow()
 
+    /** A song paused by the host, and where. */
+    data class Paused(val song: NowPlaying, val positionMs: Long)
+
+    private val _paused = MutableStateFlow<Paused?>(null)
+    val paused: StateFlow<Paused?> = _paused.asStateFlow()
+
+    /** The host's songs, in order; the current one is also FileSelectionManager's selected file. */
+    private val _playlist = MutableStateFlow<List<Uri>>(emptyList())
+    val playlist: StateFlow<List<Uri>> = _playlist.asStateFlow()
+    private val _playlistIndex = MutableStateFlow(0)
+    val playlistIndex: StateFlow<Int> = _playlistIndex.asStateFlow()
+
     /** A phone hosting on this Wi-Fi, found by [startDiscovery]. */
     data class FoundHost(val ip: String, val name: String, val listeners: Int)
 
@@ -119,7 +129,9 @@ object AudioSyncManager {
         val seq = request.substringAfter("POLL|", "0")
         val lastSeen = joinedPhones.put(fromIp, now)
         if (lastSeen == null || now - lastSeen > 3000) SyncLog.add("Host: phone $fromIp is polling")
-        val target = currentPlayTarget.takeIf { it > now } ?: 0L
+        val duration = _nowPlaying.value?.durationMs ?: 0L
+        val stillPlaying = currentPlayTarget > 0 && (duration <= 0 || now < currentPlayTarget + duration)
+        val target = if (stillPlaying) currentPlayTarget else 0L
         return "STATE|$seq|$now|${hostSongName()}|$target|$stopSeq"
     }
 
@@ -145,6 +157,7 @@ object AudioSyncManager {
         isHosting = true
         SyncServer.start()
         SongServer.start(ctx)
+        Thread { advanceWhenSongEnds() }.start()
         holdLowLatencyWifi(true)
         SyncLog.add("Host: started, address ${NetworkUtils.getLocalIpAddress(ctx)}")
         setStatus("Hosting. Pick a song, then press Play for everyone.")
@@ -222,6 +235,63 @@ object AudioSyncManager {
         activePlayers.clear()
         _nowPlaying.value = null
         _driftMs.value = null
+    }
+
+    /** Host: play the current song for everyone from [positionMs]. */
+    suspend fun playFrom(positionMs: Long = 0L) {
+        val uri = FileSelectionManager.getSelectedFile() ?: return
+        broadcastPlayCommand(uri, if (positionMs > 0) 2000L else 3000L, positionMs)
+    }
+
+    /** Host: pause for everyone, remembering where. */
+    fun pause() {
+        val song = _nowPlaying.value ?: return
+        val position = (System.currentTimeMillis() - song.startsAtLocalMs).coerceAtLeast(0L)
+        stopEveryone()
+        _paused.value = Paused(song, position)
+        SyncLog.add("Host: paused at ${position / 1000} s")
+    }
+
+    /** Host: replace the playlist with [uris] and select the first. */
+    fun setPlaylist(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        _playlist.value = uris
+        select(0)
+    }
+
+    private fun select(index: Int) {
+        _playlistIndex.value = index
+        _paused.value = null
+        FileSelectionManager.setSelectedFile(_playlist.value[index])
+    }
+
+    /** Host: go [delta] songs along the playlist; keeps playing if it was playing. */
+    suspend fun skip(delta: Int) {
+        val list = _playlist.value
+        val index = _playlistIndex.value + delta
+        if (index !in list.indices) return
+        val wasPlaying = _nowPlaying.value != null
+        stopEveryone()
+        select(index)
+        if (wasPlaying) playFrom(0L)
+    }
+
+    /** Host: when a song ends, play the next one, or stop after the last. */
+    private fun advanceWhenSongEnds() {
+        while (isHosting) {
+            try {
+                Thread.sleep(500)
+            } catch (e: InterruptedException) {
+                return
+            }
+            val song = _nowPlaying.value ?: continue
+            if (song.durationMs <= 0 || System.currentTimeMillis() < song.startsAtLocalMs + song.durationMs + 500) continue
+            if (_playlistIndex.value + 1 < _playlist.value.size) {
+                kotlinx.coroutines.runBlocking { skip(1) }
+            } else {
+                stopEveryone()
+            }
+        }
     }
 
     fun deviceName(): String =
@@ -479,7 +549,7 @@ object AudioSyncManager {
                     if (remoteStopSeq != lastRemoteStopSeq) {
                         if (lastRemoteStopSeq != -1) {
                             stopHere()
-                            setStatus("⏹️ The host stopped playback")
+                            setStatus("⏸ The host paused")
                         }
                         lastRemoteStopSeq = remoteStopSeq
                     }
@@ -489,7 +559,8 @@ object AudioSyncManager {
                         downloading = true
                         Thread { downloadSong(serverIp, song) }.start()
                     }
-                    if (targetTime > 0 && targetTime != lastTargetSeen) {
+                    // Only once the song is here: a play that arrives mid-download is joined late, in sync
+                    if (targetTime > 0 && targetTime != lastTargetSeen && !downloading && song == downloadedName) {
                         lastTargetSeen = targetTime
                         Thread { handlePlay(song, targetTime, serverIp) }.start()
                     }
@@ -584,11 +655,7 @@ object AudioSyncManager {
 
         val localStart = targetTime - offset
         val lateBy = System.currentTimeMillis() - localStart
-        if (lateBy > MAX_LATE_MS) {
-            setStatus("⚠️ Play command for '$localName' arrived $lateBy ms too late, skipped")
-            player.release()
-            return
-        }
+        stopHere() // a seek or a new song replaces what's playing
 
         SyncLog.add("Join: play '$localName' starts in ${-lateBy} ms (clock offset $offset ms, rtt $rtt ms, fine-tune $adjustMs ms)")
         setStatus("▶️ Playing '$localName' in sync with the host")
@@ -613,12 +680,15 @@ object AudioSyncManager {
     }
 
     /** Called on the phone the user presses play on. */
-    suspend fun broadcastPlayCommand(fileUri: Uri, delayMs: Long = 2000L) {
+    suspend fun broadcastPlayCommand(fileUri: Uri, delayMs: Long = 2000L, startAtMs: Long = 0L) {
         withContext(Dispatchers.IO) {
             val ctx = context
             val trackName = (ctx?.let { displayName(it, fileUri) } ?: fileUri.lastPathSegment ?: "audio")
                 .replace('|', '_')
-            val targetTime = System.currentTimeMillis() + delayMs
+            // When the song's start would have been heard; starting mid-song puts it in the past
+            val targetTime = System.currentTimeMillis() + delayMs - startAtMs
+            stopHere()
+            _paused.value = null
 
             lastTargetSeen = targetTime // don't play our own broadcast a second time
             currentPlayTarget = targetTime

@@ -13,6 +13,7 @@ object FilePickerHelper {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "audio/*"
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
         }
         activity.startActivityForResult(intent, REQUEST_CODE_PICK_AUDIO)
     }
@@ -22,18 +23,23 @@ object FilePickerHelper {
         requestCode: Int,
         resultCode: Int,
         data: Intent?,
-        onFilePicked: (Uri) -> Unit
+        onFilePicked: (List<Uri>) -> Unit
     ) {
         if (requestCode == REQUEST_CODE_PICK_AUDIO && resultCode == Activity.RESULT_OK) {
-            val uri = data?.data ?: return
+            val clips = data?.clipData
+            val uris = if (clips != null) {
+                (0 until clips.itemCount).map { clips.getItemAt(it).uri }
+            } else {
+                listOfNotNull(data?.data)
+            }
+            if (uris.isEmpty()) return
 
             // Persist permission
-            context.contentResolver.takePersistableUriPermission(
-                uri,
-                Intent.FLAG_GRANT_READ_URI_PERMISSION
-            )
+            uris.forEach { uri ->
+                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
 
-            onFilePicked(uri)
+            onFilePicked(uris)
         }
     }
 }
