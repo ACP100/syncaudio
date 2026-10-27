@@ -65,6 +65,7 @@ class MainActivity : ComponentActivity() {
                     color = MaterialTheme.colorScheme.background
                 ) {
                     var showAdvanced by remember { mutableStateOf(false) }
+                    androidx.activity.compose.BackHandler(enabled = showAdvanced) { showAdvanced = false }
                     if (showAdvanced) {
                         Column {
                             TextButton(onClick = { showAdvanced = false }) { Text("← Back to simple mode") }

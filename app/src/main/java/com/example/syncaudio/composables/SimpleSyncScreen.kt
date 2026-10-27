@@ -1,6 +1,7 @@
 // File: composables/SimpleSyncScreen.kt
 package com.example.syncaudio.composables
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -84,6 +85,21 @@ fun SimpleSyncScreen(onOpenAdvanced: () -> Unit) {
         )
     }
     var showSettings by remember { mutableStateOf(false) }
+    val activity = LocalContext.current as MainActivity
+
+    // System back goes one screen back; on the host or joined screen it only sends the app to the
+    // background, like a music app, so the music and the room keep going
+    BackHandler(enabled = screen != Screen.WELCOME) {
+        when (screen) {
+            Screen.JOIN -> screen = Screen.WELCOME
+            Screen.PARTY_STUDIO -> {
+                if (AudioSyncManager.party.value?.lineup == true) AudioSyncManager.stopParty()
+                screen = Screen.HOST
+            }
+            Screen.PARTY_LINEUP -> screen = Screen.PARTY_STUDIO
+            else -> activity.moveTaskToBack(true)
+        }
+    }
 
     Box(Modifier.fillMaxSize().background(Bg)) {
         when (screen) {
@@ -137,6 +153,8 @@ fun SimpleSyncScreen(onOpenAdvanced: () -> Unit) {
         val currentParty = party
         if (currentParty != null && !hiddenHere && (screen == Screen.HOST || screen == Screen.LISTENER)) {
             val isHost = screen == Screen.HOST
+            // On a joined phone, back leaves party mode on that phone, like its ✕
+            BackHandler(enabled = !isHost) { hiddenHere = true }
             PartyScreen(currentParty, isHost, onExit = { if (isHost) AudioSyncManager.stopParty() else hiddenHere = true })
         }
     }
