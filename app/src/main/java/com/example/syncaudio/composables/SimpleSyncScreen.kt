@@ -258,6 +258,7 @@ private fun HostScreen(onParty: () -> Unit, onSettings: () -> Unit, onLeave: () 
     val paused by AudioSyncManager.paused.collectAsState()
     val playlist by AudioSyncManager.playlist.collectAsState()
     val index by AudioSyncManager.playlistIndex.collectAsState()
+    val live by AudioSyncManager.live.collectAsState()
     val now = rememberNow()
     var showQueue by remember { mutableStateOf(false) }
     val side by AudioSyncManager.speakerSide.collectAsState()
@@ -416,8 +417,36 @@ private fun HostScreen(onParty: () -> Unit, onSettings: () -> Unit, onLeave: () 
         }
 
         Spacer(Modifier.weight(1f))
-        SecondaryButton(if (songUri == null) "Pick songs" else "Change songs", height = 52.dp) {
-            FilePickerHelper.openAudioPicker(activity)
+        if (live) {
+            // Sharing the phone's own sound instead of a song
+            Row(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Panel).padding(14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text("Sharing this phone's sound", color = Ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "Play YouTube or any app; joined phones play it ${AudioSyncManager.LIVE_DELAY_MS} ms later. " +
+                            "Turn this phone's volume down to avoid an echo.",
+                        color = Muted, fontSize = 12.sp, lineHeight = 17.sp
+                    )
+                }
+                OutlinedButton(onClick = { activity.stopPhoneSound() }, border = BorderStroke(1.5.dp, Line)) {
+                    Text("Stop", color = Ink, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        } else {
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Box(Modifier.weight(1f)) {
+                    SecondaryButton(if (songUri == null) "Pick songs" else "Change songs", height = 52.dp) {
+                        FilePickerHelper.openAudioPicker(activity)
+                    }
+                }
+                Box(Modifier.weight(1f)) {
+                    SecondaryButton("Phone sound", height = 52.dp) { activity.startPhoneSound() }
+                }
+            }
         }
         TextButton(onClick = onLeave, modifier = Modifier.align(Alignment.CenterHorizontally)) {
             Text("Stop hosting", color = Faint, fontSize = 14.sp)

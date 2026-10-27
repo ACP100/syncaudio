@@ -75,6 +75,10 @@ class LiveAudioServer(private val context: Context) {
                 val startUs = input.readLong().coerceAtLeast(0L)
                 val song = input.readUTF()
 
+                if (song == LiveCapture.SONG) {
+                    serveLive(out, startUs, who)
+                    return
+                }
                 val uri = AudioSyncManager.findSong(song)
                 if (uri == null) {
                     out.writeInt(0)
@@ -141,5 +145,36 @@ class LiveAudioServer(private val context: Context) {
         } catch (e: Exception) {
             // the phone left, seeked (it reconnects) or the host stopped
         }
+    }
+
+    /** Stream the phone sound from [startUs] (frame 0 = start of capture), as it is captured. */
+    private fun serveLive(out: DataOutputStream, startUs: Long, who: String) {
+        if (!LiveCapture.active) {
+            out.writeInt(0)
+            out.flush()
+            return
+        }
+        out.writeInt(MAGIC)
+        out.writeInt(LiveCapture.SAMPLE_RATE)
+        out.writeInt(LiveCapture.CHANNELS)
+        out.writeInt(AudioFormat.ENCODING_PCM_16BIT)
+        out.writeLong(0L) // no end
+        out.writeUTF(LiveCapture.SONG)
+        out.writeUTF("From the host's apps")
+        out.flush()
+        SyncLog.add("Host: streaming phone sound to $who")
+
+        var frame = startUs * LiveCapture.SAMPLE_RATE / 1_000_000L
+        while (running && LiveCapture.active) {
+            val (from, pcm) = LiveCapture.read(frame, 2048, 1000) ?: continue
+            out.writeLong(from * 1_000_000L / LiveCapture.SAMPLE_RATE)
+            out.writeInt(pcm.size)
+            out.write(pcm)
+            out.flush()
+            frame = from + pcm.size / 4
+        }
+        out.writeLong(-1L)
+        out.writeInt(-1)
+        out.flush()
     }
 }

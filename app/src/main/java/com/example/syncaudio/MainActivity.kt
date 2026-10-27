@@ -4,7 +4,9 @@ package com.example.syncaudio
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
+import android.media.projection.MediaProjectionManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -23,6 +25,8 @@ import com.example.syncaudio.composables.SyncAudioTestUI
 
 class MainActivity : ComponentActivity() {
     private val PERMISSION_REQUEST_CODE = 1001
+    private val REQUEST_RECORD_AUDIO = 2001
+    private val REQUEST_SCREEN_CAPTURE = 2002
     private lateinit var wifiManager: WifiP2pManager
     private lateinit var channel: WifiP2pManager.Channel
     private var wifiDirectReceiver: WifiDirectBroadcastReceiver? = null
@@ -143,6 +147,15 @@ class MainActivity : ComponentActivity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
 
+        if (requestCode == REQUEST_RECORD_AUDIO) {
+            if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+                startPhoneSound()
+            } else {
+                Toast.makeText(this, "Sharing phone sound needs the audio permission", Toast.LENGTH_LONG).show()
+            }
+            return
+        }
+
         if (requestCode == PERMISSION_REQUEST_CODE) {
             val allGranted = PermissionHelper.onRequestPermissionsResult(
                 requestCode, permissions, grantResults
@@ -165,6 +178,18 @@ class MainActivity : ComponentActivity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
 
+        if (requestCode == REQUEST_SCREEN_CAPTURE) {
+            if (resultCode == RESULT_OK && data != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val service = Intent(this, LiveCaptureService::class.java)
+                    .putExtra(LiveCaptureService.EXTRA_RESULT_CODE, resultCode)
+                    .putExtra(LiveCaptureService.EXTRA_RESULT_DATA, data)
+                ContextCompat.startForegroundService(this, service)
+            } else {
+                Toast.makeText(this, "Phone sound not shared", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+
         FilePickerHelper.handleResult(
             context = this,
             requestCode = requestCode,
@@ -178,6 +203,25 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+
+    /**
+     * Host: share this phone's sound (YouTube or any app that allows it) with every joined phone.
+     * Android asks for the audio permission once, then shows its screen-capture prompt each time.
+     */
+    fun startPhoneSound() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            Toast.makeText(this, "Sharing phone sound needs Android 10 or newer", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(android.Manifest.permission.RECORD_AUDIO), REQUEST_RECORD_AUDIO)
+            return
+        }
+        val projections = getSystemService(MediaProjectionManager::class.java)
+        startActivityForResult(projections.createScreenCaptureIntent(), REQUEST_SCREEN_CAPTURE)
+    }
+
+    fun stopPhoneSound() = AudioSyncManager.stopLive()
 
     // Create this companion object/class to manage the selected file
     object SelectedFileManager {

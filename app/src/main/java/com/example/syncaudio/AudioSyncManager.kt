@@ -209,6 +209,7 @@ object AudioSyncManager {
     }
 
     private fun hostSongName(): String {
+        if (liveMode) return LiveCapture.SONG
         val ctx = context ?: return ""
         val uri = FileSelectionManager.getSelectedFile() ?: return ""
         if (uri != cachedSongUri) {
@@ -232,7 +233,50 @@ object AudioSyncManager {
         setStatus("Hosting. Pick a song, then press Play for everyone.")
     }
 
+    // ---- Phone sound: stream whatever this phone plays (YouTube etc.) to every joined phone ----
+
+    /** How far behind the host's capture joined phones play the phone sound, to ride out Wi-Fi hiccups. */
+    const val LIVE_DELAY_MS = 400L
+
+    @Volatile private var liveMode = false
+    private val _live = MutableStateFlow(false)
+    val live: StateFlow<Boolean> = _live.asStateFlow()
+
+    /**
+     * Host, called by LiveCaptureService once capture is running: announce the phone sound like a song
+     * whose start ([captureStartMs] + LIVE_DELAY_MS, host clock) is when joined phones play frame 0.
+     * The host itself doesn't play it; its own apps already do.
+     */
+    fun startLive(captureStartMs: Long) {
+        stopHere()
+        _paused.value = null
+        liveMode = true
+        _live.value = true
+        val target = captureStartMs + LIVE_DELAY_MS
+        lastTargetSeen = target
+        currentPlayTarget = target
+        currentPlay = "${LiveCapture.SONG}|$target"
+        _nowPlaying.value = NowPlaying(LiveCapture.SONG, "From this phone's apps", target, 0L)
+        sendBroadcast("PLAY|${LiveCapture.SONG}|$target".toByteArray())
+        SyncLog.add("Host: phone sound live, joined phones play it $LIVE_DELAY_MS ms behind")
+    }
+
+    /** Host: stop sharing the phone sound (also stops it on every joined phone). */
+    fun stopLive() {
+        context?.let { LiveCaptureService.stop(it) }
+    }
+
+    /** Called by LiveCaptureService when capture ends, however it ended. */
+    fun onLiveStopped() {
+        if (!liveMode) return
+        liveMode = false
+        _live.value = false
+        stopEveryone()
+        SyncLog.add("Host: phone sound stopped")
+    }
+
     fun stopHosting() {
+        if (liveMode) stopLive()
         stopEveryone()
         isHosting = false
         SyncServer.stop()
@@ -318,6 +362,10 @@ object AudioSyncManager {
 
     /** Host: pause for everyone, remembering where. */
     fun pause() {
+        if (liveMode) {
+            stopLive()
+            return
+        }
         val song = _nowPlaying.value ?: return
         val position = (System.currentTimeMillis() - song.startsAtLocalMs).coerceAtLeast(0L)
         stopEveryone()
@@ -962,6 +1010,12 @@ object AudioSyncManager {
                 .replace('|', '_')
             // When the song's start would have been heard; starting mid-song puts it in the past
             val targetTime = System.currentTimeMillis() + delayMs - startAtMs
+            if (liveMode) {
+                // a song replaces the phone sound; end the capture without stopping the new play
+                liveMode = false
+                _live.value = false
+                context?.let { LiveCaptureService.stop(it) }
+            }
             stopHere()
             _paused.value = null
 
