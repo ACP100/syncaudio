@@ -73,6 +73,7 @@ object AudioSyncManager {
     private const val NEXT_SONG_PORT = 5006
     private val songServer = SongServer(SONG_PORT) { FileSelectionManager.getSelectedFile() }
     private val nextSongServer = SongServer(NEXT_SONG_PORT) { nextSongUri() }
+    private var liveServer: LiveAudioServer? = null
 
     /** A song being fetched from the host for playing now (not an early fetch of the next one). */
     data class Download(val song: String, val percent: Int)
@@ -224,6 +225,7 @@ object AudioSyncManager {
         SyncServer.start()
         songServer.start(ctx)
         nextSongServer.start(ctx)
+        liveServer = LiveAudioServer(ctx).also { it.start() }
         Thread { advanceWhenSongEnds() }.start()
         holdLowLatencyWifi(true)
         SyncLog.add("Host: started, address ${NetworkUtils.getLocalIpAddress(ctx)}")
@@ -237,6 +239,8 @@ object AudioSyncManager {
         songServer.stop()
         stopParty()
         nextSongServer.stop()
+        liveServer?.stop()
+        liveServer = null
         holdLowLatencyWifi(false)
         setStatus("Idle")
     }
@@ -338,6 +342,13 @@ object AudioSyncManager {
     fun nextSongName(): String {
         val ctx = context ?: return ""
         return nextSongUri()?.let { trackName(ctx, it) } ?: ""
+    }
+
+    /** Host: the playlist song (or picked song) called [name], for the live stream. */
+    fun findSong(name: String): Uri? {
+        val ctx = context ?: return null
+        val candidates = _playlist.value + listOfNotNull(FileSelectionManager.getSelectedFile())
+        return candidates.firstOrNull { trackName(ctx, it) == name }
     }
 
     private fun nextSongUri(): Uri? = _playlist.value.getOrNull(_playlistIndex.value + 1)
@@ -838,18 +849,8 @@ object AudioSyncManager {
                         }
                         lastRemoteStopSeq = remoteStopSeq
                     }
-                    val haveSong = songCache.containsKey(song)
-                    val nowMs = System.currentTimeMillis()
-                    if (song.isNotEmpty() && !haveSong && !downloading && nowMs - lastDownloadAttempt > 3000) {
-                        downloading = true
-                        Thread { downloadSong(serverIp, song) }.start()
-                    } else if (haveSong && !downloading && nowMs - lastNextQuery > 3000) {
-                        lastNextQuery = nowMs
-                        downloading = true
-                        Thread { fetchNextSong(serverIp) }.start()
-                    }
-                    // Only once the song is here: a play that arrives mid-download is joined late, in sync
-                    if (targetTime > 0 && targetTime != lastTargetSeen && haveSong) {
+                    // Songs are streamed live from the host when played, so nothing is downloaded first
+                    if (targetTime > 0 && targetTime != lastTargetSeen && song.isNotEmpty()) {
                         lastTargetSeen = targetTime
                         Thread { handlePlay(song, targetTime, serverIp) }.start()
                     }
@@ -910,30 +911,12 @@ object AudioSyncManager {
     }
 
     /** Runs on a listening phone when a PLAY command arrives. */
+    /** Joined phone: play [trackName] from the host's live stream, lined up with the host's clock. */
     private fun handlePlay(trackName: String, targetTime: Long, serverIp: String) {
         val ctx = context ?: return
-        val localFile = songCache[trackName] ?: FileSelectionManager.getSelectedFile()
-        if (localFile == null) {
-            setStatus("⚠️ The host played '$trackName' but this phone doesn't have it yet")
-            return
-        }
-
-        val localName = displayName(ctx, localFile)
-        if (localName != trackName) {
-            DebugUtils.logWarning("⚠️ Selected track '$localName' differs from '$trackName' on the server")
-        }
-
-        val player = AudioSyncPlayer(ctx)
-        if (!player.loadAudio(localFile)) {
-            setStatus("❌ Could not open '$localName' for playback")
-            return
-        }
-
-        // Measure after loading, so the decode time does not eat into the clock sample
         val measured = bestPollSample()?.takeIf { polledFrom(serverIp) } ?: TimeSync.measureBestOffset(serverIp)
         if (measured == null) {
             setStatus("❌ No clock reply from $serverIp, not playing out of sync")
-            player.release()
             return
         }
         val (offset, rtt) = measured
@@ -942,11 +925,18 @@ object AudioSyncManager {
         val lateBy = System.currentTimeMillis() - localStart
         stopHere() // a seek or a new song replaces what's playing
 
-        SyncLog.add("Join: play '$localName' starts in ${-lateBy} ms (clock offset $offset ms, rtt $rtt ms, fine-tune $adjustMs ms)")
-        setStatus("▶️ Playing '$localName' in sync with the host")
+        val player = AudioSyncPlayer(ctx)
+        val shownName = trackName.substringBeforeLast('.')
+        _nowPlaying.value = NowPlaying(shownName, "", localStart, 0L)
+        player.loadStream(serverIp, trackName) { title, artist, durationMs ->
+            // The host's tags arrive with the stream; show them if this is still the current play
+            if (activePlayers.contains(player)) _nowPlaying.value = NowPlaying(title, artist, localStart, durationMs)
+        }
+
+        SyncLog.add("Join: stream '$trackName' starts in ${-lateBy} ms (clock offset $offset ms, rtt $rtt ms, fine-tune $adjustMs ms)")
+        setStatus("▶️ Playing '$shownName' in sync with the host")
         activePlayers.add(player)
         _driftMs.value = null
-        _nowPlaying.value = songInfo(ctx, localFile, localStart)
         player.playAtTimestamp(
             targetTime,
             offset,
@@ -954,7 +944,7 @@ object AudioSyncManager {
             extraDelayMs = { adjustMs },
             onDrift = { aheadMs ->
                 _driftMs.value = aheadMs
-                _status.value = "▶️ Playing '$localName' · ${kotlin.math.abs(aheadMs)} ms from the host"
+                _status.value = "▶️ Playing '$shownName' · ${kotlin.math.abs(aheadMs)} ms from the host"
             }
         )
     }

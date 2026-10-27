@@ -28,7 +28,8 @@ import kotlin.math.sqrt
  */
 class AudioSyncPlayer(private val context: Context) {
 
-    @Volatile private var source: Uri? = null
+    // Makes the audio source for a play: the song file, or the host's live stream
+    @Volatile private var source: (() -> PcmSource)? = null
     @Volatile private var stopped = false
     @Volatile private var track: AudioTrack? = null
 
@@ -58,7 +59,6 @@ class AudioSyncPlayer(private val context: Context) {
         private const val MAX_INSERT_MS = 3000.0
         private const val FADE_MS = 3                // fade out/in around a correction so it doesn't click
         private const val TIMESTAMP_WAIT_MS = 2000L
-        private const val CODEC_TIMEOUT_US = 10_000L
         private const val QUIET_DECISIONS_PER_LOG = 5
         private const val RATE_LOG_EVERY_MS = 30_000L
         private const val LEVEL_STEP_MS = 10L
@@ -79,7 +79,7 @@ class AudioSyncPlayer(private val context: Context) {
                 SyncLog.add("Player: no audio track in the file")
                 false
             } else {
-                source = uri
+                source = { SongDecoder(context, uri) { stopped } }
                 true
             }
         } catch (e: Exception) {
@@ -89,6 +89,15 @@ class AudioSyncPlayer(private val context: Context) {
         } finally {
             extractor.release()
         }
+    }
+
+    /**
+     * Play [song] from the host's live stream instead of a file on this phone. [onInfo] gets the song's
+     * title, artist and length once the host answers.
+     */
+    fun loadStream(hostIp: String, song: String, onInfo: (String, String, Long) -> Unit) {
+        release()
+        source = { NetworkPcmSource(hostIp, song, onInfo) { stopped } }
     }
 
     /**
@@ -107,11 +116,11 @@ class AudioSyncPlayer(private val context: Context) {
         extraDelayMs: () -> Long = { 0L },
         onDrift: (Long) -> Unit = {}
     ) {
-        val uri = source ?: return
+        val makeSource = source ?: return
         stopped = false
         Thread {
             try {
-                play(uri, targetTime, currentOffset, extraDelayMs, onDrift)
+                play(makeSource, targetTime, currentOffset, extraDelayMs, onDrift)
             } catch (e: Exception) {
                 if (!stopped) {
                     SyncLog.add("Player: playback failed: ${e.javaClass.simpleName}: ${e.message}")
@@ -137,13 +146,13 @@ class AudioSyncPlayer(private val context: Context) {
     }
 
     private fun play(
-        uri: Uri,
+        makeSource: () -> PcmSource,
         targetTime: Long,
         currentOffset: () -> Long,
         extraDelayMs: () -> Long,
         onDrift: (Long) -> Unit
     ) {
-        val decoder = Decoder(uri)
+        val decoder = makeSource()
         var audioTrack: AudioTrack? = null
         try {
             // Starting mid-song (resume, seek, joining late): jump to about where the song will be once
@@ -356,8 +365,6 @@ class AudioSyncPlayer(private val context: Context) {
     private fun wallClockAt(nanoTime: Long): Double =
         System.currentTimeMillis() - (System.nanoTime() - nanoTime) / 1_000_000.0
 
-    private class Chunk(val pcm: ByteArray, val ptsUs: Long)
-
     /**
      * Writes frames to the AudioTrack and remembers which song frame each written frame holds,
      * so a reported output position can be turned back into a song position. Corrections are
@@ -562,82 +569,5 @@ class AudioSyncPlayer(private val context: Context) {
                 if (t.write(buffer, buffer.remaining(), AudioTrack.WRITE_BLOCKING) <= 0) break
             }
         }
-    }
-
-    /** Decodes the song to PCM, one codec buffer at a time. */
-    private inner class Decoder(uri: Uri) {
-        private val extractor = MediaExtractor()
-        private val codec: MediaCodec
-        private val info = MediaCodec.BufferInfo()
-        private var inputDone = false
-        private var outputDone = false
-        val mime: String
-        var outputFormat: MediaFormat
-
-        init {
-            extractor.setDataSource(context, uri, null)
-            val index = findAudioTrack(extractor)
-            require(index >= 0) { "No audio track in $uri" }
-            extractor.selectTrack(index)
-            outputFormat = extractor.getTrackFormat(index)
-            mime = outputFormat.getString(MediaFormat.KEY_MIME)!!
-            codec = MediaCodec.createDecoderByType(mime)
-            codec.configure(outputFormat, null, null, 0)
-            codec.start()
-        }
-
-        /** Before the first [next]: start decoding near [us] into the song. */
-        fun seekTo(us: Long) {
-            extractor.seekTo(us, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
-        }
-
-        /** Next decoded buffer, or null at the end of the song. */
-        fun next(): Chunk? {
-            while (!outputDone && !stopped) {
-                if (!inputDone) {
-                    val inIndex = codec.dequeueInputBuffer(CODEC_TIMEOUT_US)
-                    if (inIndex >= 0) {
-                        val size = extractor.readSampleData(codec.getInputBuffer(inIndex)!!, 0)
-                        if (size < 0) {
-                            codec.queueInputBuffer(inIndex, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                            inputDone = true
-                        } else {
-                            codec.queueInputBuffer(inIndex, 0, size, extractor.sampleTime, 0)
-                            extractor.advance()
-                        }
-                    }
-                }
-                val outIndex = codec.dequeueOutputBuffer(info, CODEC_TIMEOUT_US)
-                if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    outputFormat = codec.outputFormat
-                } else if (outIndex >= 0) {
-                    if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) outputDone = true
-                    var chunk: Chunk? = null
-                    if (info.size > 0) {
-                        val out = codec.getOutputBuffer(outIndex)!!
-                        out.position(info.offset)
-                        out.limit(info.offset + info.size)
-                        chunk = Chunk(ByteArray(info.size).also { out.get(it) }, info.presentationTimeUs)
-                    }
-                    codec.releaseOutputBuffer(outIndex, false)
-                    if (chunk != null) return chunk
-                }
-            }
-            return null
-        }
-
-        fun release() {
-            try { codec.stop() } catch (e: Exception) {}
-            codec.release()
-            extractor.release()
-        }
-    }
-
-    private fun findAudioTrack(extractor: MediaExtractor): Int {
-        for (i in 0 until extractor.trackCount) {
-            val mime = extractor.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: continue
-            if (mime.startsWith("audio/")) return i
-        }
-        return -1
     }
 }
