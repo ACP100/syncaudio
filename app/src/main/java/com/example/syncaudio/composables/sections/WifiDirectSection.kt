@@ -10,6 +10,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.example.syncaudio.MainActivity
+import com.example.syncaudio.PermissionHelper
 
 import com.example.syncaudio.composables.components.*
 import kotlinx.coroutines.Dispatchers
@@ -79,6 +80,13 @@ fun WifiDirectSection(
                 // Discovery button
                 Button(
                     onClick = {
+                        // Android only lets an app scan for Wi-Fi Direct devices with location
+                        // (Nearby devices on Android 13+) allowed, so ask now, only for this tool
+                        if (!PermissionHelper.checkPermissions(activity)) {
+                            PermissionHelper.requestPermissions(activity, 1001)
+                            onStatusUpdate("Allow the permission, then tap Discover again")
+                            return@Button
+                        }
                         scope.launch {
                             withContext(Dispatchers.Main) {
                                 isDiscovering = true

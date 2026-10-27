@@ -42,9 +42,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (!PermissionHelper.checkPermissions(this)) {
-            PermissionHelper.requestPermissions(this, PERMISSION_REQUEST_CODE)
-        }
+        // No permission request here: syncing over Wi-Fi needs none. Location (Nearby devices on
+        // Android 13+) is only asked for when the Wi-Fi Direct testing tool scans for devices.
         initWifiDirect()
 
         // Initialize SyncClient with context
